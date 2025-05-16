@@ -3,6 +3,10 @@ from datetime import datetime
 import numpy as np
 import os
 import random
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import torch
 import torch.nn as nn
 import wandb
@@ -12,43 +16,68 @@ from gazelle.model import get_gazelle_model
 from gazelle.utils import gazefollow_auc, gazefollow_l2
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', type=str, default="gazelle_dinov2_vitb14")
-parser.add_argument('--data_path', type=str, default='./data/gazefollow')
-parser.add_argument('--ckpt_save_dir', type=str, default='./experiments')
-parser.add_argument('--wandb_project', type=str, default='gazelle')
-parser.add_argument('--exp_name', type=str, default='train_gazefollow')
-parser.add_argument('--log_iter', type=int, default=10, help='how often to log loss during training')
-parser.add_argument('--max_epochs', type=int, default=15)
-parser.add_argument('--batch_size', type=int, default=60)
-parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--n_workers', type=int, default=8)
+parser.add_argument("--model", type=str, default="gazelle_dinov2_vits14")
+parser.add_argument("--data_path", type=str, default="./data/gazefollow")
+parser.add_argument("--ckpt_save_dir", type=str, default="./experiments")
+parser.add_argument("--wandb_project", type=str, default="gazelle")
+parser.add_argument("--exp_name", type=str, default="train_gazefollow")
+parser.add_argument(
+    "--log_iter", type=int, default=10, help="how often to log loss during training"
+)
+parser.add_argument("--max_epochs", type=int, default=15)
+parser.add_argument("--batch_size", type=int, default=60)
+parser.add_argument("--lr", type=float, default=1e-3)
+parser.add_argument("--n_workers", type=int, default=8)
 args = parser.parse_args()
+
+# Determine device
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+print(f"Using device: {device}")
 
 
 def main():
-    wandb.init(
-        project=args.wandb_project,
-        name=args.exp_name,
-        config=vars(args)
+    wandb.init(project=args.wandb_project, name=args.exp_name, config=vars(args))
+    exp_dir = os.path.join(
+        args.ckpt_save_dir, args.exp_name, datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     )
-    exp_dir = os.path.join(args.ckpt_save_dir, args.exp_name, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     os.makedirs(exp_dir)
 
     model, transform = get_gazelle_model(args.model)
-    model.cuda()
+    model.to(device)
 
-    for param in model.backbone.parameters(): # freeze backbone
+    for param in model.backbone.parameters():  # freeze backbone
         param.requires_grad = False
-    print(f"Learnable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+    print(
+        f"Learnable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
+    )
 
-    train_dataset = GazeDataset('gazefollow', args.data_path, 'train', transform)
-    train_dl = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=args.n_workers)
-    eval_dataset = GazeDataset('gazefollow', args.data_path, 'test', transform)
-    eval_dl = torch.utils.data.DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=args.n_workers)
+    train_dataset = GazeDataset("gazefollow", args.data_path, "train", transform)
+    train_dl = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=args.n_workers,
+    )
+    eval_dataset = GazeDataset("gazefollow", args.data_path, "test", transform)
+    eval_dl = torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=args.n_workers,
+    )
 
     loss_fn = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_epochs, eta_min=1e-7)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.max_epochs, eta_min=1e-7
+    )
 
     best_min_l2 = 1.0
     best_epoch = None
@@ -58,22 +87,28 @@ def main():
         model.train()
         for cur_iter, batch in enumerate(train_dl):
             imgs, bboxes, gazex, gazey, inout, heights, widths, heatmaps = batch
+            imgs = imgs.to(device)
+            heatmaps = heatmaps.to(device)
 
             optimizer.zero_grad()
-            preds = model({"images": imgs.cuda(), "bboxes": [[bbox] for bbox in bboxes]})
-            heatmap_preds = torch.stack(preds['heatmap']).squeeze(dim=1)
+            preds = model({"images": imgs, "bboxes": [[bbox] for bbox in bboxes]})
+            heatmap_preds = torch.stack(preds["heatmap"]).squeeze(dim=1)
 
-            loss = loss_fn(heatmap_preds, heatmaps.cuda())
+            loss = loss_fn(heatmap_preds, heatmaps)
             loss.backward()
             optimizer.step()
 
             if cur_iter % args.log_iter == 0:
                 wandb.log({"train/loss": loss.item()})
-                print("TRAIN EPOCH {}, iter {}/{}, loss={}".format(epoch, cur_iter, len(train_dl), round(loss.item(), 4)))
+                print(
+                    "TRAIN EPOCH {}, iter {}/{}, loss={}".format(
+                        epoch, cur_iter, len(train_dl), round(loss.item(), 4)
+                    )
+                )
 
         scheduler.step()
 
-        ckpt_path = os.path.join(exp_dir, 'epoch_{}.pt'.format(epoch))
+        ckpt_path = os.path.join(exp_dir, "epoch_{}.pt".format(epoch))
         torch.save(model.get_gazelle_state_dict(), ckpt_path)
         print("Saved checkpoint to {}".format(ckpt_path))
 
@@ -85,13 +120,16 @@ def main():
         aucs = []
         for cur_iter, batch in enumerate(eval_dl):
             imgs, bboxes, gazex, gazey, inout, heights, widths = batch
+            imgs = imgs.to(device)
 
             with torch.no_grad():
-                preds = model({"images": imgs.cuda(), "bboxes": [[bbox] for bbox in bboxes]})
+                preds = model({"images": imgs, "bboxes": [[bbox] for bbox in bboxes]})
 
-            heatmap_preds = torch.stack(preds['heatmap']).squeeze(dim=1)
+            heatmap_preds = torch.stack(preds["heatmap"]).squeeze(dim=1)
             for i in range(heatmap_preds.shape[0]):
-                auc = gazefollow_auc(heatmap_preds[i], gazex[i], gazey[i], heights[i], widths[i])
+                auc = gazefollow_auc(
+                    heatmap_preds[i], gazex[i], gazey[i], heights[i], widths[i]
+                )
                 avg_l2, min_l2 = gazefollow_l2(heatmap_preds[i], gazex[i], gazey[i])
                 aucs.append(auc)
                 avg_l2s.append(avg_l2)
@@ -101,16 +139,35 @@ def main():
         epoch_min_l2 = np.mean(min_l2s)
         epoch_auc = np.mean(aucs)
 
-        wandb.log({"eval/auc": epoch_auc, "eval/min_l2": epoch_min_l2, "eval/avg_l2": epoch_avg_l2, "epoch": epoch})
-        print("EVAL EPOCH {}: AUC={}, Min L2={}, Avg L2={}".format(epoch, round(epoch_auc, 4), round(epoch_min_l2, 4), round(epoch_avg_l2, 4)))
+        wandb.log(
+            {
+                "eval/auc": epoch_auc,
+                "eval/min_l2": epoch_min_l2,
+                "eval/avg_l2": epoch_avg_l2,
+                "epoch": epoch,
+            }
+        )
+        print(
+            "EVAL EPOCH {}: AUC={}, Min L2={}, Avg L2={}".format(
+                epoch,
+                round(epoch_auc, 4),
+                round(epoch_min_l2, 4),
+                round(epoch_avg_l2, 4),
+            )
+        )
 
         if epoch_min_l2 < best_min_l2:
             best_min_l2 = epoch_min_l2
             best_epoch = epoch
 
-    print("Completed training. Best Min L2 of {} obtained at epoch {}".format(round(best_min_l2, 4), best_epoch))
+    print(
+        "Completed training. Best Min L2 of {} obtained at epoch {}".format(
+            round(best_min_l2, 4), best_epoch
+        )
+    )
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)

@@ -63,7 +63,7 @@ class GazeLLE(nn.Module):
 
         num_ppl_per_img = [len(bbox_list) for bbox_list in input["bboxes"]]
         x = self.backbone.forward(input["images"])
-        x = self.linear(x)
+        x = self.linear(x.contiguous())
         x = x + self.pos_embed
         x = utils.repeat_tensors(
             x, num_ppl_per_img
@@ -195,6 +195,7 @@ def positionalencoding2d(d_model, height, width):
 # models
 def get_gazelle_model(model_name):
     factory = {
+        "gazelle_dinov2_vits14": gazelle_dinov2_vits14,
         "gazelle_dinov2_vitb14": gazelle_dinov2_vitb14,
         "gazelle_dinov2_vitl14": gazelle_dinov2_vitl14,
         "gazelle_dinov2_vitb14_inout": gazelle_dinov2_vitb14_inout,
