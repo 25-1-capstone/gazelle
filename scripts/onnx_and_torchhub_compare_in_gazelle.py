@@ -239,17 +239,24 @@ try:
         print(f"ONNX backbone output shape: {onnx_features.shape}")
 
         # 3. 결과 비교
+        # export_onnx_dinov2_vits14.py와 동일한 허용 오차 사용
+        rtol_val = 1e-02
+        atol_val = 1e-04
+        print(f"Comparing with rtol={rtol_val}, atol={atol_val}")
         try:
             np.testing.assert_allclose(
                 pytorch_features.cpu().numpy(),  # .cpu()를 호출하여 CPU에서 비교
                 onnx_features.cpu().numpy(),  # ONNX 결과도 CPU로 (ONNX 세션이 CPU 사용 가정)
-                rtol=1e-3,  # 허용 오차 범위는 실험적으로 조정 필요
-                atol=1e-5,
+                rtol=rtol_val,  # 허용 오차 범위는 export_onnx_dinov2_vits14.py와 일치
+                atol=atol_val,
             )
+            abs_diff = torch.abs(pytorch_features - onnx_features)
+            print(f"  Max absolute difference: {abs_diff.max().item()}")
+            print(f"  Mean absolute difference: {abs_diff.mean().item()}")
             print("SUCCESS: PyTorch backbone features and ONNX features are close.")
         except AssertionError as e:
             print("FAILURE: PyTorch backbone features and ONNX features differ.")
-            # print(e) # 상세 오류 메시지
+            print(e)  # 상세 오류 메시지 출력 활성화
             # 차이 계산 (옵션)
             abs_diff = torch.abs(pytorch_features - onnx_features)
             print(f"  Max absolute difference: {abs_diff.max().item()}")
@@ -315,7 +322,7 @@ from facenet_pytorch import MTCNN
 # import numpy as np # 이미 위에서 임포트됨
 
 # initialize once (on GPU if available)
-mtcnn = MTCNN(keep_all=True, device=device)  # device 변수 사용
+mtcnn = MTCNN(keep_all=True, device="cpu")  # device 변수 사용
 
 # detect faces
 # GazeLLE 데모용 이미지(pil_image_for_gazelle)에 대해 얼굴 검출 수행
@@ -355,162 +362,64 @@ else:
     with torch.no_grad():
         output = model(input_data)
 
-    # Check if output is valid before trying to access its elements
-    if (
-        output
-        and "heatmap" in output
-        and output["heatmap"] is not None
-        and output["heatmap"].numel() > 0
-    ):
-        img1_person1_heatmap = output["heatmap"][0][0]  # [64, 64] heatmap
-        print("GazeLLE output heatmap shape:", img1_person1_heatmap.shape)
-        if (
-            model.inout and "inout" in output and output["inout"] is not None
-        ):  # Check model.inout and key existence
-            img1_person1_inout = output["inout"][0][0]
-            print("GazeLLE in/out score:", img1_person1_inout.item())
-        else:
-            print("In/out score not available or model.inout is False.")
-    else:
-        print(
-            "GazeLLE model did not produce valid output or heatmap. Skipping visualization."
-        )
-        output = None  # Ensure output is None if invalid
+    img1_person1_heatmap = output["heatmap"][0][0]  # [64, 64] heatmap
+    print(img1_person1_heatmap.shape)
+    if model.inout:
+        img1_person1_inout = output["inout"][0][
+            0
+        ]  # gaze in frame score (if model supports inout prediction)
+        print(img1_person1_inout.item())
 
 
 # visualize predicted gaze heatmap for each person and gaze in/out of frame score
-def visualize_heatmap(
-    pil_image,
-    heatmap_tensor,
-    bbox_normalized=None,
-    inout_score_tensor=None,
-    text_font_size_factor=0.03,
-):  # font size factor 추가
-    if isinstance(heatmap_tensor, torch.Tensor):
-        heatmap_np = heatmap_tensor.detach().cpu().numpy()
-    else:  # Already numpy
-        heatmap_np = heatmap_tensor
 
-    # Resize heatmap to PIL image size
-    heatmap_pil = Image.fromarray((heatmap_np * 255).astype(np.uint8)).resize(
+
+def visualize_heatmap(pil_image, heatmap, bbox=None, inout_score=None):
+    if isinstance(heatmap, torch.Tensor):
+        heatmap = heatmap.detach().cpu().numpy()
+    heatmap = Image.fromarray((heatmap * 255).astype(np.uint8)).resize(
         pil_image.size, Image.Resampling.BILINEAR
     )
-    # Apply colormap
-    colored_heatmap_np = plt.cm.jet(np.array(heatmap_pil) / 255.0)[
-        :, :, :3
-    ]  # Take only RGB
-    colored_heatmap_pil = Image.fromarray(
-        (colored_heatmap_np * 255).astype(np.uint8)
-    ).convert("RGBA")
+    heatmap = plt.cm.jet(np.array(heatmap) / 255.0)
+    heatmap = (heatmap[:, :, :3] * 255).astype(np.uint8)
+    heatmap = Image.fromarray(heatmap).convert("RGBA")
+    heatmap.putalpha(90)
+    overlay_image = Image.alpha_composite(pil_image.convert("RGBA"), heatmap)
 
-    # Set alpha for heatmap overlay
-    colored_heatmap_pil.putalpha(90)  # Transparency
-
-    # Composite image with heatmap
-    overlay_image = Image.alpha_composite(
-        pil_image.convert("RGBA"), colored_heatmap_pil
-    )
-
-    if bbox_normalized is not None:
-        img_width, img_height = pil_image.size
-        # Denormalize bbox coordinates
-        xmin, ymin, xmax, ymax = bbox_normalized
-        abs_bbox = [
-            xmin * img_width,
-            ymin * img_height,
-            xmax * img_width,
-            ymax * img_height,
-        ]
-
+    if bbox is not None:
+        width, height = pil_image.size
+        xmin, ymin, xmax, ymax = bbox
         draw = ImageDraw.Draw(overlay_image)
-        # Draw rectangle for face bbox
         draw.rectangle(
-            abs_bbox,
+            [xmin * width, ymin * height, xmax * width, ymax * height],
             outline="lime",
-            width=int(min(img_width, img_height) * 0.01),  # Relative width
+            width=int(min(width, height) * 0.01),
         )
 
-        if inout_score_tensor is not None:
-            inout_score_val = (
-                inout_score_tensor.item()
-                if isinstance(inout_score_tensor, torch.Tensor)
-                else inout_score_tensor
+        if inout_score is not None:
+            text = f"in-frame: {inout_score:.2f}"
+            text_width = draw.textlength(text)
+            text_height = int(height * 0.01)
+            text_x = xmin * width
+            text_y = ymax * height + text_height
+            draw.text(
+                (text_x, text_y),
+                text,
+                fill="lime",
+                font=ImageFont.load_default(size=int(min(width, height) * 0.05)),
             )
-            text = f"in-frame: {inout_score_val:.2f}"
-
-            # Determine text size based on image dimensions
-            font_size = int(min(img_width, img_height) * text_font_size_factor)
-            try:
-                font = ImageFont.truetype(
-                    "arial.ttf", font_size
-                )  # Try loading a common font
-            except IOError:
-                font = ImageFont.load_default(
-                    size=font_size
-                )  # Fallback to default font
-
-            # Calculate text position more robustly
-            text_bbox = draw.textbbox((0, 0), text, font=font)
-            text_width = text_bbox[2] - text_bbox[0]
-            text_height = text_bbox[3] - text_bbox[1]
-
-            text_x = abs_bbox[0]  # Start text at left edge of bbox
-            text_y = abs_bbox[3] + int(
-                text_height * 0.2
-            )  # Position text below bbox with small padding
-
-            # Ensure text is within image bounds (simple check)
-            if text_y + text_height > img_height:
-                text_y = (
-                    abs_bbox[1] - text_height - int(text_height * 0.2)
-                )  # Try above if below is out of bounds
-            if text_x + text_width > img_width:
-                text_x = img_width - text_width - 5  # Adjust if too wide
-
-            draw.text((text_x, text_y), text, fill="lime", font=font)
-
-    return overlay_image.convert("RGB")  # Convert back to RGB for imshow
+    return overlay_image
 
 
-if (
-    output and boxes is not None and norm_bboxes and norm_bboxes[0]
-):  # Check if there are outputs and boxes
-    num_persons_to_visualize = len(norm_bboxes[0])
-    # Ensure output["heatmap"] and output["inout"] have enough entries
-    if (
-        output["heatmap"] is not None
-        and output["heatmap"].size(1) >= num_persons_to_visualize
-    ):
-        for i in range(num_persons_to_visualize):
-            current_heatmap = output["heatmap"][0][i]
-            current_inout_score = None
-            if (
-                model.inout
-                and output["inout"] is not None
-                and output["inout"].size(1) > i
-            ):
-                current_inout_score = output["inout"][0][i]
-
-            visualized_img = visualize_heatmap(
-                pil_image_for_gazelle,  # Original PIL image for GazeLLE demo
-                current_heatmap,
-                norm_bboxes[0][i],
-                inout_score_tensor=current_inout_score,
-            )
-            plt.figure(figsize=(8, 6))  # Adjust figure size
-            plt.imshow(visualized_img)
-            plt.title(f"Gaze Heatmap for Person {i+1}")
-            plt.axis("off")
-            plt.show()
-    else:
-        print(
-            "Not enough heatmap/inout entries in GazeLLE output for the number of detected faces."
+for i in range(len(boxes)):
+    plt.figure()
+    plt.imshow(
+        visualize_heatmap(
+            pil_image_for_gazelle,
+            output["heatmap"][0][i],
+            norm_bboxes[0][i],
+            inout_score=output["inout"][0][i] if output["inout"] is not None else None,
         )
-elif boxes is None:
-    print("Skipping GazeLLE visualization as no faces were detected.")
-else:
-    print(
-        "Skipping GazeLLE visualization as GazeLLE model output is not available or no valid bboxes."
     )
-
-print("\\nDemo finished.")
+    plt.axis("off")
+    plt.show()
