@@ -195,6 +195,7 @@ def positionalencoding2d(d_model, height, width):
 # models
 def get_gazelle_model(model_name):
     factory = {
+        "gazelle_dinov2_vits14_224_224": gazelle_dinov2_vits14_224_224,
         "gazelle_dinov2_vits14": gazelle_dinov2_vits14,
         "gazelle_dinov2_vitb14": gazelle_dinov2_vitb14,
         "gazelle_dinov2_vitl14": gazelle_dinov2_vitl14,
@@ -203,6 +204,13 @@ def get_gazelle_model(model_name):
     }
     assert model_name in factory.keys(), "invalid model name"
     return factory[model_name]()
+
+
+def gazelle_dinov2_vits14_224_224():
+    backbone = DinoV2Backbone("dinov2_vits14")
+    transform = backbone.get_transform((224, 224))
+    model = GazeLLE(backbone, in_size=(224, 224))
+    return model, transform
 
 
 def gazelle_dinov2_vits14():
