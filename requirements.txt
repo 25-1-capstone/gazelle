@@ -57,14 +57,12 @@ MarkupSafe==3.0.2
 matplotlib==3.10.3
 matplotlib-inline==0.1.7
 mdurl==0.1.2
-mediapipe==0.10.21
 ml_dtypes==0.5.1
 mpmath==1.3.0
 mtcnn==1.0.0
 namex==0.0.9
 nest-asyncio==1.6.0
 networkx==3.4.2
-numpy==2.2.5
 opencv-contrib-python==4.11.0.86
 opencv-python==4.11.0.86
 opt_einsum==3.4.0
