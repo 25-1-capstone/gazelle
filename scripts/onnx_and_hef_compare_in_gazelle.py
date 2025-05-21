@@ -169,7 +169,7 @@ print(
 # backbone_s14.model은 torch.hub에서 로드된 원본 DINOv2 모델임
 
 # 2. GazeLLE 모델을 s14 백본으로 직접 초기화
-model = GazeLLE(backbone=backbone_s14)
+model = GazeLLE(backbone=backbone_s14, in_size=IMG_SIZE)
 print(f"GazeLLE model initialized with dino_vits14 backbone.")
 
 # 3. 변환(transform)은 생성된 s14 백본에서 가져오기 (GazeLLE용: 448x448)
