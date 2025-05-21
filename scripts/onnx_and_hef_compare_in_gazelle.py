@@ -376,18 +376,13 @@ else:
 
         # 1. Prepare HEF input from pil_image_for_comparison (already resized to IMG_SIZE)
         # pil_image_for_comparison is PIL, RGB, size IMG_SIZE
-        hef_input_np_hwc_255 = np.array(pil_image_for_comparison).astype(
-            np.float32
-        )  # H, W, C, 0-255
-
-        # Apply hailo_normalize (expects HWC, 0-255, float32)
-        hef_input_normalized_hwc = hailo_normalize(
-            hef_input_np_hwc_255
-        )  # H, W, C, normalized
+        hef_input_np_hwc_raw_uint8 = np.array(pil_image_for_comparison).astype(
+            np.uint8
+        )  # H, W, C, 0-255, uint8
 
         # Add batch dimension: (1, H, W, C) - typical for HEF
-        hef_input_final = np.expand_dims(hef_input_normalized_hwc, axis=0)
-        print(f"HEF input tensor shape: {hef_input_final.shape}")
+        hef_input_final = np.expand_dims(hef_input_np_hwc_raw_uint8, axis=0)
+        print(f"HEF input tensor shape (raw uint8): {hef_input_final.shape}")
 
         # 2. Perform HEF inference
         hef_model_obj = hpf.HEF(args.hef)
@@ -430,25 +425,33 @@ else:
             # Configure the HEF on the device
             network_group = target.configure(hef_model_obj)[0]  # First network group from the HEF
             
+            # Sanity check: Print what the HEF thinks it should receive
+            print("HEF expected preprocess info:")
+            for name, info in network_group.get_preprocess_info().items():
+                print(f"  Input '{name}': mean={info.mean}, std={info.std}, order={info.order}, format={info.format.type}")
+
             # Set up inference parameters
-            in_params = hpf.InputVStreamParams.make_from_network_group(network_group, quantized=False, format_type=hpf.FormatType.FLOAT32)
+            in_params = hpf.InputVStreamParams.make_from_network_group(network_group, quantized=True, format_type=hpf.FormatType.UINT8)
             out_params = hpf.OutputVStreamParams.make_from_network_group(network_group, quantized=False, format_type=hpf.FormatType.FLOAT32)
             
-            # Resize the input tensor to match the expected input shape
+            # Resize the input tensor to match the expected input shape if necessary
             expected_h, expected_w = expected_hef_shape_no_batch[0], expected_hef_shape_no_batch[1]
             if actual_hef_input_shape_no_batch != expected_hef_shape_no_batch:
-                print(f"Resizing input from {actual_hef_input_shape_no_batch} to {expected_hef_shape_no_batch}")
+                print(f"Resizing HEF input from {actual_hef_input_shape_no_batch} to {expected_hef_shape_no_batch} (H, W, C)")
                 from PIL import Image
-                # Convert numpy array to PIL Image, resize, and convert back to numpy
-                img_pil = Image.fromarray(hef_input_final[0].astype(np.uint8))
-                img_resized = img_pil.resize((expected_w, expected_h), Image.Resampling.BICUBIC)
-                # Convert back to float32 and normalize
-                resized_np = np.array(img_resized).astype(np.float32)
-                # Apply normalization to the resized image
-                resized_normalized = hailo_normalize(resized_np)
+                # hef_input_final is (N,H,W,C) and uint8. We need to resize H,W for each image in batch.
+                # Assuming batch size 1 for this resizing logic.
+                if hef_input_final.shape[0] != 1:
+                    raise NotImplementedError("HEF input resizing logic currently supports batch size 1 only.")
+
+                img_pil_to_resize = Image.fromarray(hef_input_final[0]) # Use [0] to get HWC from NHWC
+                img_resized_pil = img_pil_to_resize.resize((expected_w, expected_h), Image.Resampling.BICUBIC)
+                # Convert back to uint8 numpy array
+                resized_np_uint8 = np.array(img_resized_pil).astype(np.uint8) # 데이터 타입을 uint8로 유지
+                # No hailo_normalize here
                 # Add batch dimension back
-                hef_input_final = np.expand_dims(resized_normalized, axis=0)
-                print(f"Resized input tensor shape: {hef_input_final.shape}")
+                hef_input_final = np.expand_dims(resized_np_uint8, axis=0)
+                print(f"Resized HEF input tensor shape: {hef_input_final.shape}")
             
             # Activate the network and perform inference
             with network_group.activate():
