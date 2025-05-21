@@ -374,17 +374,7 @@ else:
 
         print(f"Using HEF model from: {args.hef}")
 
-        # 1. Prepare HEF input from pil_image_for_comparison (already resized to IMG_SIZE)
-        # pil_image_for_comparison is PIL, RGB, size IMG_SIZE
-        hef_input_np_hwc_raw_uint8 = np.array(pil_image_for_comparison).astype(
-            np.uint8
-        )  # H, W, C, 0-255, uint8
-
-        # Add batch dimension: (1, H, W, C) - typical for HEF
-        hef_input_final = np.expand_dims(hef_input_np_hwc_raw_uint8, axis=0)
-        print(f"HEF input tensor shape (raw uint8): {hef_input_final.shape}")
-
-        # 2. Perform HEF inference
+        # 1. Prepare HEF input
         hef_model_obj = hpf.HEF(args.hef)
         input_vstream_infos = hef_model_obj.get_input_vstream_infos()
         output_vstream_infos = hef_model_obj.get_output_vstream_infos()
@@ -394,6 +384,35 @@ else:
         if not output_vstream_infos:
             raise RuntimeError("No output vstream info found in HEF.")
 
+        # Get HEF expected input shape (H, W, C)
+        # input_vstream_infos[0].shape can be (H,W,C) or (N,H,W,C)
+        # We are interested in H, W for resizing the PIL image
+        if len(input_vstream_infos[0].shape) == 3: # H, W, C
+            hef_expected_h_in = input_vstream_infos[0].shape[0]
+            hef_expected_w_in = input_vstream_infos[0].shape[1]
+        elif len(input_vstream_infos[0].shape) == 4: # N, H, W, C
+            hef_expected_h_in = input_vstream_infos[0].shape[1]
+            hef_expected_w_in = input_vstream_infos[0].shape[2]
+        else:
+            raise RuntimeError(f"Unexpected HEF input shape: {input_vstream_infos[0].shape}")
+        
+        print(f"HEF model expects input HxW: {hef_expected_h_in}x{hef_expected_w_in}")
+
+        # Resize pil_image_for_comparison to HEF's expected dimensions
+        pil_for_hef_resized = pil_image_for_comparison.resize(
+            (hef_expected_w_in, hef_expected_h_in), Image.Resampling.BICUBIC
+        )
+        print(f"Resized PIL image for HEF to: {pil_for_hef_resized.size}")
+
+        # Convert the resized PIL image to UINT8 NumPy array (H, W, C)
+        hef_input_np_uint8_hwc = np.array(pil_for_hef_resized) # This is already uint8
+
+        # Add batch dimension: (1, H, W, C)
+        hef_input_final = np.expand_dims(hef_input_np_uint8_hwc, axis=0)
+        print(f"HEF input tensor final shape (UINT8): {hef_input_final.shape}, dtype: {hef_input_final.dtype}")
+
+
+        # 2. Perform HEF inference (hef_model_obj, input_vstream_infos, output_vstream_infos already defined)
         hef_input_name = input_vstream_infos[0].name
         hef_output_name = output_vstream_infos[0].name
 
@@ -410,14 +429,15 @@ else:
         expected_hef_shape_no_batch = tuple(
             input_vstream_infos[0].shape[-3:]
         )  # H, W, C
-        actual_hef_input_shape_no_batch = tuple(hef_input_final.shape[1:])  # H, W, C
+        actual_hef_input_shape_no_batch = tuple(hef_input_final.shape[1:])  # H, W, C (from our uint8 NHWC array)
 
         if expected_hef_shape_no_batch != actual_hef_input_shape_no_batch:
             print(
-                f"Warning: HEF expected input HWC {expected_hef_shape_no_batch} but got {actual_hef_input_shape_no_batch}"
+                f"Warning: HEF expected input HWC {expected_hef_shape_no_batch} but actual input HWC is {actual_hef_input_shape_no_batch} after preparation. This should not happen if resizing was correct."
             )
-            # This could be due to padding or other HEF compilation settings.
-            # For now, we proceed, but this might be a source of discrepancy.
+            # If this warning appears, there's a discrepancy between how input_vstream_infos[0].shape
+            # was interpreted for resizing vs. for this check.
+            # However, hef_input_final is already prepared with the target dimensions and uint8 type.
 
         print("Performing HEF inference...")
         # Create a VDevice and configure it with the HEF
@@ -426,32 +446,44 @@ else:
             network_group = target.configure(hef_model_obj)[0]  # First network group from the HEF
             
             # Sanity check: Print what the HEF thinks it should receive
-            print("HEF expected preprocess info:")
-            for name, info in network_group.get_preprocess_info().items():
-                print(f"  Input '{name}': mean={info.mean}, std={info.std}, order={info.order}, format={info.format.type}")
+            print("HEF expected input stream properties:")
+            # input_vstream_infos is already defined from hef_model_obj.get_input_vstream_infos() earlier in the script
+            for vstream_info in input_vstream_infos:
+                try:
+                    order_str = str(vstream_info.format.order)
+                except AttributeError:
+                    order_str = "N/A"
+                try:
+                    format_type_str = str(vstream_info.format.type)
+                except AttributeError:
+                    format_type_str = "N/A"
+
+                print(f"  Input '{vstream_info.name}': shape={vstream_info.shape}, order={order_str}, format_type={format_type_str}")
+                # Note: Mean and Std for normalization are typically applied externally before HEF inference.
+                # This script uses MEAN_255 and STD_255 defined globally.
 
             # Set up inference parameters
             in_params = hpf.InputVStreamParams.make_from_network_group(network_group, quantized=True, format_type=hpf.FormatType.UINT8)
             out_params = hpf.OutputVStreamParams.make_from_network_group(network_group, quantized=False, format_type=hpf.FormatType.FLOAT32)
             
             # Resize the input tensor to match the expected input shape if necessary
+            # THIS BLOCK IS NOW REDUNDANT as hef_input_final is already prepared with correct size and uint8 type.
+            '''
             expected_h, expected_w = expected_hef_shape_no_batch[0], expected_hef_shape_no_batch[1]
-            if actual_hef_input_shape_no_batch != expected_hef_shape_no_batch:
+            if actual_hef_input_shape_no_batch != expected_hef_shape_no_batch: # This check is mostly covered above
                 print(f"Resizing HEF input from {actual_hef_input_shape_no_batch} to {expected_hef_shape_no_batch} (H, W, C)")
-                from PIL import Image
-                # hef_input_final is (N,H,W,C) and uint8. We need to resize H,W for each image in batch.
-                # Assuming batch size 1 for this resizing logic.
-                if hef_input_final.shape[0] != 1:
-                    raise NotImplementedError("HEF input resizing logic currently supports batch size 1 only.")
-
-                img_pil_to_resize = Image.fromarray(hef_input_final[0]) # Use [0] to get HWC from NHWC
+                # from PIL import Image # Already imported
+                # hef_input_final is (N,H,W,C) and float32. Convert to uint8 for PIL.
+                img_to_resize_uint8 = hef_input_final[0].astype(np.uint8)
+                img_pil_to_resize = Image.fromarray(img_to_resize_uint8) # Now expects uint8
                 img_resized_pil = img_pil_to_resize.resize((expected_w, expected_h), Image.Resampling.BICUBIC)
-                # Convert back to uint8 numpy array
-                resized_np_uint8 = np.array(img_resized_pil).astype(np.uint8) # 데이터 타입을 uint8로 유지
+                # Convert back to float32 numpy array as was the original intention for hef_input_final
+                resized_np_float32 = np.array(img_resized_pil).astype(np.float32)
                 # No hailo_normalize here
                 # Add batch dimension back
-                hef_input_final = np.expand_dims(resized_np_uint8, axis=0)
+                hef_input_final = np.expand_dims(resized_np_float32, axis=0)
                 print(f"Resized HEF input tensor shape: {hef_input_final.shape}")
+            '''
             
             # Activate the network and perform inference
             with network_group.activate():
@@ -548,103 +580,12 @@ else:
         traceback.print_exc()
 
 print("--- End HEF Comparison ---\\n")
-
-
-# --- 이하 GazeLLE 추론 및 시각화 로직 (기존 코드 유지) ---
-
-# 데모용 이미지 로드 (GazeLLE용)
-# image_url = "https://www.looper.com/img/gallery/the-office-funniest-moments-ranked/jim-and-dwights-customer-service-training-1627594561.jpg"
-# ... (기존 이미지 로드 로직은 이미 위에서 한 번 실행됨, pil_image_for_comparison을 사용하거나 다시 로드)
-# 여기서는 비교에 사용된 pil_image_for_comparison을 GazeLLE 데모에도 사용하도록 수정
-# 단, GazeLLE는 (448,448) 입력을 기대하므로, gazelle_transform을 적용해야 함.
-
-try:
-    # pil_image_for_comparison 변수가 위 ONNX 비교 블록에서 성공적으로 로드되었다고 가정
-    # 만약 ONNX 비교가 실패했거나 이미지가 로드되지 않았다면, 여기서 다시 로드해야 할 수 있음.
-    if "pil_image_for_comparison" not in locals() or pil_image_for_comparison is None:
-        print(
-            "Re-loading image for GazeLLE demo as it was not available from ONNX comparison."
-        )
-        response = requests.get(image_url, stream=True)
-        response.raise_for_status()
-        pil_image_for_gazelle = Image.open(BytesIO(response.content)).convert("RGB")
-    else:
-        pil_image_for_gazelle = (
-            pil_image_for_comparison  # ONNX 비교에 사용된 이미지 재활용
-        )
-
-    width, height = pil_image_for_gazelle.size
-
-    # plt.imshow(pil_image_for_gazelle) # 이미지 표시는 후반부 시각화에서 처리
-    # plt.axis("off")
-    # plt.show()
-
-except requests.exceptions.RequestException as e:
-    print(f"Error downloading image for GazeLLE demo: {e}")
-    exit()
-except NameError:  # pil_image_for_comparison이 정의되지 않은 경우 대비
-    print(
-        "Error: pil_image_for_comparison not defined. Cannot proceed with GazeLLE demo."
-    )
-    exit()
-
-
 from facenet_pytorch import MTCNN
 
 # import numpy as np # 이미 위에서 임포트됨
 
 # initialize once (on GPU if available)
 mtcnn = MTCNN(keep_all=True, device="cpu")  # device 변수 사용
-
-# detect faces
-# GazeLLE 데모용 이미지(pil_image_for_gazelle)에 대해 얼굴 검출 수행
-# MTCNN은 PIL 이미지를 직접 받거나 numpy 배열로 변환해야 함
-boxes, probs = mtcnn.detect(pil_image_for_gazelle)  # PIL 이미지 직접 전달
-
-# boxes is an N×4 array of [x1, y1, x2, y2]
-# Handle case where no faces are detected
-if boxes is None:
-    print("No faces detected in the image for GazeLLE demo. Exiting.")
-    exit()
-print("Detected face boxes for GazeLLE:", boxes)
-
-
-# prepare gazelle input
-# GazeLLE용 변환(gazelle_transform)과 이미지(pil_image_for_gazelle) 사용
-img_tensor = gazelle_transform(pil_image_for_gazelle).unsqueeze(0).to(device)
-
-# Normalize bboxes (ensure boxes are not None)
-norm_bboxes = (
-    [[np.array(bbox) / np.array([width, height, width, height]) for bbox in boxes]]
-    if boxes is not None
-    else []
-)
-
-
-input_data = {  # 변수명 변경: input -> input_data (파이썬 내장 함수와 충돌 방지)
-    "images": img_tensor,  # [num_images, 3, 448, 448]
-    "bboxes": norm_bboxes,  # [[img1_bbox1, img1_bbox2...], [img2_bbox1, img2_bbox2]...]
-}
-
-if (
-    not norm_bboxes or not norm_bboxes[0]
-):  # Check if norm_bboxes is empty or contains an empty list
-    print("No bounding boxes to process for GazeLLE. Skipping inference.")
-else:
-    with torch.no_grad():
-        output = model(input_data)
-
-    img1_person1_heatmap = output["heatmap"][0][0]  # [64, 64] heatmap
-    print(img1_person1_heatmap.shape)
-    if model.inout:
-        img1_person1_inout = output["inout"][0][
-            0
-        ]  # gaze in frame score (if model supports inout prediction)
-        print(img1_person1_inout.item())
-
-
-# visualize predicted gaze heatmap for each person and gaze in/out of frame score
-
 
 def visualize_heatmap(pil_image, heatmap, bbox=None, inout_score=None):
     if isinstance(heatmap, torch.Tensor):
@@ -682,16 +623,101 @@ def visualize_heatmap(pil_image, heatmap, bbox=None, inout_score=None):
             )
     return overlay_image
 
+# --- GazeLLE 추론 with Pytorch Features (새로운 섹션) ---
+print("\\n--- Running GazeLLE with Pre-extracted PyTorch Features ---")
+if "pytorch_features" in locals() and pytorch_features is not None:
+    if "pil_image_for_comparison" in locals() and pil_image_for_comparison is not None:
+        try:
+            # 1. pytorch_features의 정보 가져오기
+            # pytorch_features는 (B, C, H_feat, W_feat) 형태
+            _, feature_dim, feat_h, feat_w = pytorch_features.shape
+            print(f"Using PyTorch features with shape: B={_}, C={feature_dim}, H_feat={feat_h}, W_feat={feat_w}")
 
-for i in range(len(boxes)):
-    plt.figure()
-    plt.imshow(
-        visualize_heatmap(
-            pil_image_for_gazelle,
-            output["heatmap"][0][i],
-            norm_bboxes[0][i],
-            inout_score=output["inout"][0][i] if output["inout"] is not None else None,
-        )
-    )
-    plt.axis("off")
-    plt.show()
+            # 2. 새로운 GazeLLE 모델 인스턴스 생성 (backbone 없이)
+            gazelle_from_features = GazeLLE(
+                backbone=None, 
+                inout=model.inout, 
+                dim=model.dim, 
+                num_layers=model.num_layers,
+                featmap_h=feat_h,
+                featmap_w=feat_w,
+                feature_dim=feature_dim,
+                out_size=model.out_size
+            )
+            
+            if args.pth and os.path.exists(args.pth):
+                print(f"Loading GazeLLE head weights for gazelle_from_features from: {args.pth}")
+                checkpoint_feat = torch.load(args.pth, map_location=device)
+                actual_state_dict_feat = None
+                if isinstance(checkpoint_feat, dict):
+                    if "model_state_dict" in checkpoint_feat: actual_state_dict_feat = checkpoint_feat["model_state_dict"]
+                    elif "state_dict" in checkpoint_feat: actual_state_dict_feat = checkpoint_feat["state_dict"]
+                    elif "model" in checkpoint_feat: actual_state_dict_feat = checkpoint_feat["model"]
+                    else: actual_state_dict_feat = checkpoint_feat
+                else: actual_state_dict_feat = checkpoint_feat
+                
+                if actual_state_dict_feat is None:
+                     raise ValueError("Loaded checkpoint for features model is None.")
+
+                gazelle_from_features.load_gazelle_state_dict(actual_state_dict_feat, include_backbone=False)
+                print("Successfully loaded GazeLLE head weights into gazelle_from_features.")
+            else:
+                print("No .pth file provided or found for gazelle_from_features. Using uninitialized head.")
+
+            gazelle_from_features.eval()
+            gazelle_from_features.to(device)
+
+            width_feat, height_feat = pil_image_for_comparison.size
+            boxes_feat, _ = mtcnn.detect(pil_image_for_comparison)
+
+            if boxes_feat is None:
+                print("No faces detected in the image for GazeLLE with features. Skipping.")
+            else:
+                print(f"Detected face boxes for GazeLLE with features: {boxes_feat}")
+                norm_bboxes_feat = [[np.array(bbox) / np.array([width_feat, height_feat, width_feat, height_feat]) for bbox in boxes_feat]]
+
+                input_data_feat = {
+                    "extracted_features": pytorch_features.to(device), 
+                    "bboxes": norm_bboxes_feat,
+                }
+                
+                hef_input_data_feat = {
+                    "extracted_features": hef_features.to(device), 
+                    "bboxes": norm_bboxes_feat,
+                }
+
+                if not norm_bboxes_feat or not norm_bboxes_feat[0]:
+                    print("No bounding boxes to process for GazeLLE with features. Skipping inference.")
+                else:
+                    with torch.no_grad():
+                        # output_feat = gazelle_from_features(input_data_feat)
+                        output_feat = gazelle_from_features(hef_input_data_feat)
+                    print("Visualizing results from GazeLLE with PyTorch features:")
+                    for i in range(len(boxes_feat)):
+                        plt.figure(figsize=(8,8))
+                        plt.imshow(
+                            visualize_heatmap(
+                                pil_image_for_comparison, 
+                                output_feat["heatmap"][0][i],
+                                norm_bboxes_feat[0][i],
+                                inout_score=output_feat["inout"][0][i] if output_feat["inout"] is not None else None,
+                            )
+                        )
+                        plt.title(f"GazeLLE (PyTorch Feat) - Person {i+1}")
+                        plt.axis("off")
+                        #plt.show()
+                        # 생성된 이미지를 파일로 저장합니다.
+                        output_filename = f"gazelle_pytorch_feat_person_{i+1}.png"
+                        plt.savefig(output_filename)
+                        plt.close() # 다음 플롯을 위해 현재 플롯을 닫습니다.
+                        print(f"Saved GazeLLE (PyTorch Feat) visualization to {output_filename}")
+        except Exception as e_feat:
+            print(f"Error during GazeLLE inference with PyTorch features: {e_feat}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("pil_image_for_comparison not available. Skipping GazeLLE with PyTorch features.")
+else:
+    print("PyTorch features (pytorch_features) not available. Skipping GazeLLE with PyTorch features.")
+print("--- End GazeLLE with PyTorch Features ---\\n")
+
