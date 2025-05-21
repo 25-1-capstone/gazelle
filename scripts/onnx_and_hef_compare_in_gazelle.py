@@ -425,14 +425,37 @@ else:
             # For now, we proceed, but this might be a source of discrepancy.
 
         print("Performing HEF inference...")
-        hef_output_dict = hpf.infer_model(
-            args.hef,  # Pass the HEF file path
-            {hef_input_name: hef_input_final},
-            # target=hpf.TargetDevice() # Or specific target, e.g. hpf.PUBLIC_DEVICE_IDS.HAILO8L
-            # Leaving it to default SDK behavior for now.
-        )
+        # Create a VDevice and configure it with the HEF
+        with hpf.VDevice() as target:
+            # Configure the HEF on the device
+            network_group = target.configure(hef_model_obj)[0]  # First network group from the HEF
+            
+            # Set up inference parameters
+            in_params = hpf.InputVStreamParams.make_from_network_group(network_group, quantized=False, format_type=hpf.FormatType.FLOAT32)
+            out_params = hpf.OutputVStreamParams.make_from_network_group(network_group, quantized=False, format_type=hpf.FormatType.FLOAT32)
+            
+            # Resize the input tensor to match the expected input shape
+            expected_h, expected_w = expected_hef_shape_no_batch[0], expected_hef_shape_no_batch[1]
+            if actual_hef_input_shape_no_batch != expected_hef_shape_no_batch:
+                print(f"Resizing input from {actual_hef_input_shape_no_batch} to {expected_hef_shape_no_batch}")
+                from PIL import Image
+                # Convert numpy array to PIL Image, resize, and convert back to numpy
+                img_pil = Image.fromarray(hef_input_final[0].astype(np.uint8))
+                img_resized = img_pil.resize((expected_w, expected_h), Image.Resampling.BICUBIC)
+                # Convert back to float32 and normalize
+                resized_np = np.array(img_resized).astype(np.float32)
+                # Apply normalization to the resized image
+                resized_normalized = hailo_normalize(resized_np)
+                # Add batch dimension back
+                hef_input_final = np.expand_dims(resized_normalized, axis=0)
+                print(f"Resized input tensor shape: {hef_input_final.shape}")
+            
+            # Activate the network and perform inference
+            with network_group.activate():
+                with hpf.InferVStreams(network_group, in_params, out_params) as infer_pipeline:
+                    hef_output_dict = infer_pipeline.infer({hef_input_name: hef_input_final})
 
-        hef_features_raw_np = hef_output_dict[hef_output_name]
+        hef_features_raw_np = hef_output_dict[hef_output_name]  # Get the output from the output name
         print(
             f"HEF backbone raw output shape: {hef_features_raw_np.shape}"
         )  # Expected (1, H_feat, W_feat, C_feat)
