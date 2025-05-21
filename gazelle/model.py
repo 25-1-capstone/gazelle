@@ -11,23 +11,35 @@ from gazelle.backbone import DinoV2Backbone
 class GazeLLE(nn.Module):
     def __init__(
         self,
-        backbone,
+        backbone=None,
         inout=False,
         dim=256,
         num_layers=3,
         in_size=(448, 448),
         out_size=(64, 64),
+        featmap_h=None,
+        featmap_w=None,
+        feature_dim=None,
     ):
         super().__init__()
         self.backbone = backbone
         self.dim = dim
         self.num_layers = num_layers
-        self.featmap_h, self.featmap_w = backbone.get_out_size(in_size)
         self.in_size = in_size
         self.out_size = out_size
         self.inout = inout
 
-        self.linear = nn.Conv2d(backbone.get_dimension(), self.dim, 1)
+        if backbone is not None:
+            self.featmap_h, self.featmap_w = backbone.get_out_size(in_size)
+            _feature_dim = backbone.get_dimension()
+        elif featmap_h is not None and featmap_w is not None and feature_dim is not None:
+            self.featmap_h = featmap_h
+            self.featmap_w = featmap_w
+            _feature_dim = feature_dim
+        else:
+            raise ValueError("Either backbone or (featmap_h, featmap_w, feature_dim) must be provided.")
+
+        self.linear = nn.Conv2d(_feature_dim, self.dim, 1)
         self.head_token = nn.Embedding(1, self.dim)
         self.register_buffer(
             "pos_embed",
@@ -58,11 +70,19 @@ class GazeLLE(nn.Module):
             )
 
     def forward(self, input):
-        # input["images"]: [B, 3, H, W] tensor of images
+        # input["images"]: [B, 3, H, W] tensor of images (optional)
+        # input["extracted_features"]: [B, C_feat, H_feat, W_feat] tensor of features (optional)
         # input["bboxes"]: list of lists of bbox tuples [[(xmin, ymin, xmax, ymax)]] per image in normalized image coords
 
         num_ppl_per_img = [len(bbox_list) for bbox_list in input["bboxes"]]
-        x = self.backbone.forward(input["images"])
+
+        if "extracted_features" in input and input["extracted_features"] is not None:
+            x = input["extracted_features"]
+        elif self.backbone is not None and "images" in input:
+            x = self.backbone.forward(input["images"])
+        else:
+            raise ValueError("Either 'extracted_features' or ('backbone' and 'images') must be provided in input.")
+        
         x = self.linear(x.contiguous())
         x = x + self.pos_embed
         x = utils.repeat_tensors(
