@@ -169,3 +169,6 @@ cython_debug/
 data/gazefollow/
 *.onnx
 *.DS_Store*
+*h264
+*mp4
+output_frames
