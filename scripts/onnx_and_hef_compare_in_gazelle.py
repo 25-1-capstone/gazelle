@@ -690,8 +690,8 @@ if "pytorch_features" in locals() and pytorch_features is not None:
                     print("No bounding boxes to process for GazeLLE with features. Skipping inference.")
                 else:
                     with torch.no_grad():
-                        # output_feat = gazelle_from_features(input_data_feat)
-                        output_feat = gazelle_from_features(hef_input_data_feat)
+                        #output_feat = gazelle_from_features(input_data_feat)
+                         output_feat = gazelle_from_features(hef_input_data_feat)
                     print("Visualizing results from GazeLLE with PyTorch features:")
                     for i in range(len(boxes_feat)):
                         plt.figure(figsize=(8,8))
