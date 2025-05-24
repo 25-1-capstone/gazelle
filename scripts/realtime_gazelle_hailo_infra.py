@@ -46,7 +46,7 @@ from hailo_apps_infra.gstreamer_helper_pipelines import (
 class GazeLLECallbackClass(app_callback_class):
     """Custom callback class for GazeLLE processing"""
     def __init__(self, gazelle_model, device='cpu', output_dir='./output_frames', 
-                 save_interval=1.0, max_frames=10, hef_path=None):
+                 save_interval=1.0, max_frames=10, hef_path=None, skip_frames=0):
         super().__init__()
         self.gazelle_model = gazelle_model
         self.device = device
@@ -58,6 +58,9 @@ class GazeLLECallbackClass(app_callback_class):
         self.saved_frames = 0
         self.frame_count = 0  # Add frame counter
         self.last_tensors = None  # Store tensors from hailonet
+        self.skip_frames = skip_frames  # Process every N+1 frames
+        self.last_process_time = 0
+        self.processing_times = []  # Track processing times
         
         # Initialize Hailo device for direct inference
         if hef_path:
@@ -133,9 +136,18 @@ def gazelle_callback(pad, info, user_data):
     """Callback function for processing frames with GazeLLE"""
     user_data.frame_count += 1
     
+    # Skip frames if configured
+    if user_data.skip_frames > 0 and user_data.frame_count % (user_data.skip_frames + 1) != 0:
+        return Gst.PadProbeReturn.OK
+    
+    # Measure processing time
+    start_time = time.time()
+    
     # Only print debug every 10 frames to reduce noise
     if user_data.frame_count % 10 == 1:
-        print(f"[DEBUG] Processing frame {user_data.frame_count}")
+        if user_data.processing_times:
+            avg_time = sum(user_data.processing_times[-10:]) / len(user_data.processing_times[-10:])
+            print(f"[DEBUG] Frame {user_data.frame_count}, Avg processing: {avg_time*1000:.1f}ms")
     
     # Get buffer
     buffer = info.get_buffer()
@@ -256,6 +268,12 @@ def gazelle_callback(pad, info, user_data):
             import traceback
             traceback.print_exc()
     
+    # Record processing time
+    processing_time = time.time() - start_time
+    user_data.processing_times.append(processing_time)
+    if len(user_data.processing_times) > 100:  # Keep only last 100 times
+        user_data.processing_times.pop(0)
+    
     return Gst.PadProbeReturn.OK
 
 
@@ -321,6 +339,7 @@ def get_gazelle_parser():
     parser.add_argument("--max-frames", type=int, default=10, help="Maximum number of frames to save")
     parser.add_argument("--save-interval", type=float, default=1.0, help="Interval between saving frames")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode (no display)")
+    parser.add_argument("--skip-frames", type=int, default=0, help="Skip N frames between processing (0=process all)")
     
     return parser
 
@@ -363,8 +382,11 @@ class GStreamerGazeLLEApp(GStreamerApp):
         )
         
         # User callback - process frames directly
+        # leaky=downstream drops new frames when full (keeps old frames)
+        # leaky=upstream drops old frames when full (keeps new frames) - better for real-time
+        # max-size-buffers=5 reduces queue size to drop frames earlier
         user_callback_pipeline = (
-            f'queue name=hailo_pre_callback_q leaky=downstream max-size-buffers=30 max-size-bytes=0 max-size-time=0 ! '
+            f'queue name=hailo_pre_callback_q leaky=upstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! '
             f'identity name=identity_callback '
         )
         
@@ -472,7 +494,8 @@ def main():
         output_dir=args.output_dir,
         save_interval=args.save_interval,
         max_frames=args.max_frames,
-        hef_path=args.hef
+        hef_path=args.hef,
+        skip_frames=args.skip_frames
     )
     
     # Create and run the app
