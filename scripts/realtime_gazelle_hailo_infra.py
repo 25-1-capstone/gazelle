@@ -44,9 +44,20 @@ from hailo_apps_infra.gstreamer_helper_pipelines import (
 
 
 class GazeLLECallbackClass(app_callback_class):
-    """Custom callback class for GazeLLE processing"""
+    """
+    Custom callback class for GazeLLE processing
+    
+    This class handles the main processing pipeline:
+    1. Receives video frames from GStreamer
+    2. Runs DINOv2 feature extraction using Hailo accelerator
+    3. Detects faces using MTCNN
+    4. Performs gaze estimation using GazeLLE model
+    5. Saves results and visualizations
+    """
     def __init__(self, gazelle_model, device='cpu', output_dir='./output_frames', 
-                 save_interval=1.0, max_frames=10, hef_path=None, skip_frames=0):
+                 save_interval=1.0, max_frames=10, hef_path=None, skip_frames=0,
+                 save_inference_results=False, inference_output_dir='./inference_results',
+                 save_mode='time'):
         super().__init__()
         self.gazelle_model = gazelle_model
         self.device = device
@@ -62,6 +73,23 @@ class GazeLLECallbackClass(app_callback_class):
         self.last_process_time = 0
         self.processing_times = []  # Track processing times
         
+        # Save mode configuration
+        self.save_mode = save_mode  # 'time' or 'frame'
+        # save_interval is interpreted based on save_mode:
+        # - 'time': interval in seconds (float)
+        # - 'frame': interval in frames (int)
+        self.save_interval = int(save_interval) if save_mode == 'frame' else float(save_interval)
+        self.last_saved_frame_count = 0  # Track last saved frame for frame-based saving
+        
+        # Inference results saving
+        self.save_inference_results = save_inference_results
+        self.inference_output_dir = Path(inference_output_dir)
+        if self.save_inference_results:
+            self.inference_output_dir.mkdir(exist_ok=True)
+        self.last_inference_save_time = time.time()
+        self.last_inference_saved_frame_count = 0  # Track last saved inference frame
+        self.saved_inference_results = 0
+        
         # Initialize Hailo device for direct inference
         if hef_path:
             self.init_hailo_inference(hef_path)
@@ -70,6 +98,12 @@ class GazeLLECallbackClass(app_callback_class):
         self.mtcnn = MTCNN(keep_all=True, device='cpu')
         print(f"Initialized MTCNN face detector")
         print(f"Output frames will be saved to: {self.output_dir}")
+        if self.save_mode == 'time':
+            print(f"Saving frames every {self.save_interval} seconds")
+        else:
+            print(f"Saving frames every {self.save_interval} frames")
+        if self.save_inference_results:
+            print(f"Inference results will be saved to: {self.inference_output_dir}")
     
     def init_hailo_inference(self, hef_path):
         """Initialize Hailo device for direct inference"""
@@ -83,7 +117,7 @@ class GazeLLECallbackClass(app_callback_class):
         network_group = self.vdevice.configure(self.hef, configure_params)[0]
         
         # Get input/output info with format type
-        self.input_vstreams_params = InputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
+        self.input_vstreams_params = InputVStreamParams.make(network_group, quantized=True, format_type=FormatType.UINT8)
         self.output_vstreams_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
             
         # Create vstreams
@@ -115,12 +149,20 @@ class GazeLLECallbackClass(app_callback_class):
         # Resize frame to model input size
         resized = cv2.resize(frame, (w, h))
         
-        # Normalize to [0, 1] if needed
-        normalized = resized.astype(np.float32) / 255.0
+        # Debug: Check if cv2.resize changes format
+        if hasattr(self, '_first_inference'):
+            if not self._first_inference:
+                print(f"[FORMAT CHECK] After cv2.resize - shape: {resized.shape}, sample pixel: {resized[h//2, w//2]}")
+                self._first_inference = True
+        else:
+            self._first_inference = False
+        
+        # No normalization - keep UINT8 values as expected by HEF
+        # The HEF expects UINT8 input in 0-255 range
         
         # Run inference
         with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as infer_pipeline:
-            input_data = {list(self.input_vstreams_params.keys())[0]: np.expand_dims(normalized, axis=0)}
+            input_data = {list(self.input_vstreams_params.keys())[0]: np.expand_dims(resized, axis=0)}
             
             with self.network_group.activate(None):
                 infer_results = infer_pipeline.infer(input_data)
@@ -129,12 +171,25 @@ class GazeLLECallbackClass(app_callback_class):
         
     def should_continue(self):
         """Check if we should continue processing"""
-        return self.saved_frames < self.max_frames
+        # Let the pipeline keep running; limit only the saving
+        return True
 
 
 def gazelle_callback(pad, info, user_data):
     """Callback function for processing frames with GazeLLE"""
     user_data.frame_count += 1
+    
+    # Get buffer and timestamp
+    buffer = info.get_buffer()
+    if buffer is None:
+        return Gst.PadProbeReturn.OK
+    
+    # Get PTS (presentation timestamp) for accurate timing
+    pts_ms = buffer.pts / Gst.SECOND * 1000  # nanoseconds to milliseconds
+    if not hasattr(user_data, 'first_pts'):
+        user_data.first_pts = pts_ms
+        user_data.nominal_fps = 30  # Default to 30fps, could be detected from caps
+    rel_t = (pts_ms - user_data.first_pts) / 1000.0  # seconds since start
     
     # Skip frames if configured
     if user_data.skip_frames > 0 and user_data.frame_count % (user_data.skip_frames + 1) != 0:
@@ -149,13 +204,12 @@ def gazelle_callback(pad, info, user_data):
             avg_time = sum(user_data.processing_times[-10:]) / len(user_data.processing_times[-10:])
             print(f"[DEBUG] Frame {user_data.frame_count}, Avg processing: {avg_time*1000:.1f}ms")
     
-    # Get buffer
-    buffer = info.get_buffer()
-    if buffer is None:
+    # Check if we should continue processing (but not necessarily saving)
+    if not user_data.should_continue():
         return Gst.PadProbeReturn.OK
     
-    # Check if we should continue
-    if not user_data.should_continue():
+    # Check if we've already saved max frames
+    if user_data.saved_frames >= user_data.max_frames:
         return Gst.PadProbeReturn.OK
     
     # Get video frame
@@ -163,10 +217,23 @@ def gazelle_callback(pad, info, user_data):
     if format is None or width is None or height is None:
         return Gst.PadProbeReturn.OK
     
+    # Debug: Print format
+    if user_data.frame_count == 1:
+        print(f"[FORMAT CHECK] GStreamer buffer format: {format}")
+    
     # Get the frame
     frame = get_numpy_from_buffer(buffer, format, width, height)
     if frame is None:
         return Gst.PadProbeReturn.OK
+    
+    # Debug: Check frame shape and sample pixel
+    if user_data.frame_count == 1:
+        print(f"[FORMAT CHECK] Frame shape: {frame.shape}")
+        print(f"[FORMAT CHECK] Frame dtype: {frame.dtype}")
+        # Sample a pixel to check channel order (center pixel)
+        center_y, center_x = frame.shape[0]//2, frame.shape[1]//2
+        pixel = frame[center_y, center_x]
+        print(f"[FORMAT CHECK] Center pixel RGB values: R={pixel[0]}, G={pixel[1]}, B={pixel[2]}")
     
     # Run Hailo inference directly on the frame
     if hasattr(user_data, 'run_hailo_inference'):
@@ -201,6 +268,9 @@ def gazelle_callback(pad, info, user_data):
             feat_tensor = torch.from_numpy(feat_processed).to(user_data.device)
             
             # Face detection for bounding boxes
+            # Debug: MTCNN expects RGB format
+            if user_data.frame_count == 1:
+                print(f"[FORMAT CHECK] Sending frame to MTCNN with shape: {frame.shape}")
             boxes_original, probs = user_data.mtcnn.detect(frame)
             
             if boxes_original is not None and len(boxes_original) > 0:
@@ -257,11 +327,40 @@ def gazelle_callback(pad, info, user_data):
                 # Add detection to ROI
                 roi.add_object(detection)
             
-            # Save frame if interval has passed
-            current_time = time.time()
-            if current_time - user_data.last_save_time >= user_data.save_interval:
+            # Save frame based on configured mode using original timestamps
+            should_save_frame = False
+            
+            if user_data.save_mode == 'time':
+                # Time-based saving using PTS
+                if rel_t - getattr(user_data, 'last_save_ts', -1e9) >= user_data.save_interval:
+                    should_save_frame = True
+                    user_data.last_save_ts = rel_t
+            elif user_data.save_mode == 'frame':
+                # Frame count-based saving using original frame index
+                orig_frame_idx = int(rel_t * user_data.nominal_fps)
+                if orig_frame_idx - getattr(user_data, 'last_saved_orig_idx', -1e9) >= user_data.save_interval:
+                    should_save_frame = True
+                    user_data.last_saved_orig_idx = orig_frame_idx
+            
+            if should_save_frame:
                 save_gazelle_frame(frame, boxes, heatmaps, user_data)
-                user_data.last_save_time = current_time
+            
+            # Save inference results if enabled (using same timestamp-based logic)
+            if user_data.save_inference_results:
+                should_save_inference = False
+                
+                if user_data.save_mode == 'time':
+                    if rel_t - getattr(user_data, 'last_inference_save_ts', -1e9) >= user_data.save_interval:
+                        should_save_inference = True
+                        user_data.last_inference_save_ts = rel_t
+                elif user_data.save_mode == 'frame':
+                    orig_frame_idx = int(rel_t * user_data.nominal_fps)
+                    if orig_frame_idx - getattr(user_data, 'last_inference_saved_orig_idx', -1e9) >= user_data.save_interval:
+                        should_save_inference = True
+                        user_data.last_inference_saved_orig_idx = orig_frame_idx
+                
+                if should_save_inference:
+                    save_inference_results(feat_tensor, boxes, heatmaps, user_data)
                 
         except Exception as e:
             print(f"[DEBUG] Processing error: {e}")
@@ -280,6 +379,9 @@ def gazelle_callback(pad, info, user_data):
 def save_gazelle_frame(frame, boxes, heatmaps, user_data):
     """Save frame with gaze visualization"""
     try:
+        # Debug: PIL expects RGB format
+        if user_data.saved_frames == 0:
+            print(f"[FORMAT CHECK] Creating PIL image from array with shape: {frame.shape}")
         frame_pil = Image.fromarray(frame)
         
         # Use first face's heatmap for visualization
@@ -327,6 +429,29 @@ def save_gazelle_frame(frame, boxes, heatmaps, user_data):
         print(f"[DEBUG] Error saving frame: {e}")
 
 
+def save_inference_results(feat_tensor, boxes, heatmaps, user_data):
+    """Save raw inference results (features, boxes, heatmaps) to disk"""
+    try:
+        # Create result dictionary
+        result_dict = {
+            'frame_number': user_data.frame_count,
+            'timestamp': time.time(),
+            'features': feat_tensor.cpu().numpy(),  # DINOv2 features [1, C, H, W]
+            'boxes': boxes,  # Face bounding boxes
+            'heatmaps': heatmaps,  # Gaze heatmaps
+        }
+        
+        # Save as numpy compressed file
+        output_path = user_data.inference_output_dir / f"inference_{user_data.saved_inference_results + 1:04d}.npz"
+        np.savez_compressed(output_path, **result_dict)
+        
+        print(f"Saved inference results {user_data.saved_inference_results + 1} to {output_path}")
+        user_data.saved_inference_results += 1
+        
+    except Exception as e:
+        print(f"[DEBUG] Error saving inference results: {e}")
+
+
 def get_gazelle_parser():
     """Get argument parser with GazeLLE-specific arguments"""
     parser = get_default_parser()
@@ -337,9 +462,12 @@ def get_gazelle_parser():
     parser.add_argument("--device", default="cpu", help="Torch device for GazeLLE head (cpu or cuda)")
     parser.add_argument("--output-dir", default="./output_frames", help="Directory to save output frames")
     parser.add_argument("--max-frames", type=int, default=10, help="Maximum number of frames to save")
-    parser.add_argument("--save-interval", type=float, default=1.0, help="Interval between saving frames")
+    parser.add_argument("--save-mode", choices=['time', 'frame'], default='time', help="Save mode: 'time' for time-based intervals, 'frame' for frame count-based intervals")
+    parser.add_argument("--save-interval", type=float, default=1.0, help="Save interval: seconds (if save-mode=time) or frames (if save-mode=frame)")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode (no display)")
     parser.add_argument("--skip-frames", type=int, default=0, help="Skip N frames between processing (0=process all)")
+    parser.add_argument("--save-inference", action="store_true", help="Save raw inference results (features, boxes, heatmaps)")
+    parser.add_argument("--inference-output-dir", default="./inference_results", help="Directory to save inference results")
     
     return parser
 
@@ -384,9 +512,9 @@ class GStreamerGazeLLEApp(GStreamerApp):
         # User callback - process frames directly
         # leaky=downstream drops new frames when full (keeps old frames)
         # leaky=upstream drops old frames when full (keeps new frames) - better for real-time
-        # max-size-buffers=5 reduces queue size to drop frames earlier
+        # max-size-buffers=60 provides 2 seconds of buffer at 30fps
         user_callback_pipeline = (
-            f'queue name=hailo_pre_callback_q leaky=upstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! '
+            f'queue name=hailo_pre_callback_q leaky=downstream max-size-buffers=60 max-size-bytes=0 max-size-time=0 ! '
             f'identity name=identity_callback '
         )
         
@@ -454,10 +582,15 @@ def main():
     # Get HEF input dimensions
     import hailo_platform as hpf
     hef_model = hpf.HEF(args.hef)
+    
+    # hef 모델의 입력 정보에 대해서 가져오기
     input_vs = hef_model.get_input_vstream_infos()
+    
+    # 입력 정보가 없으면 오류 출력하고 종료
     if not input_vs:
         print("Failed to get HEF input info", file=sys.stderr)
         sys.exit(1)
+    
     
     shape = input_vs[0].shape
     if len(shape) == 3:
@@ -495,7 +628,10 @@ def main():
         save_interval=args.save_interval,
         max_frames=args.max_frames,
         hef_path=args.hef,
-        skip_frames=args.skip_frames
+        skip_frames=args.skip_frames,
+        save_inference_results=args.save_inference,
+        inference_output_dir=args.inference_output_dir,
+        save_mode=args.save_mode
     )
     
     # Create and run the app
