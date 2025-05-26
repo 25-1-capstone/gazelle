@@ -58,44 +58,56 @@ class GazeLLECallbackClass(app_callback_class):
                  save_interval=1.0, max_frames=10, hef_path=None, skip_frames=0,
                  save_inference_results=False, inference_output_dir='./inference_results',
                  save_mode='time'):
+        # Initialize parent callback class
         super().__init__()
-        self.gazelle_model = gazelle_model
-        self.device = device
+        
+        # Core models and processing configuration
+        self.gazelle_model = gazelle_model  # Pre-trained GazeLLE gaze estimation model
+        self.device = device  # PyTorch device (cpu/cuda) for GazeLLE head processing
+        
+        # Output directory setup for saving processed frames
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
-        self.save_interval = save_interval
-        self.max_frames = max_frames
-        self.last_save_time = time.time()
-        self.saved_frames = 0
-        self.frame_count = 0  # Add frame counter
-        self.last_tensors = None  # Store tensors from hailonet
-        self.skip_frames = skip_frames  # Process every N+1 frames
-        self.last_process_time = 0
-        self.processing_times = []  # Track processing times
         
-        # Save mode configuration
-        self.save_mode = save_mode  # 'time' or 'frame'
-        # save_interval is interpreted based on save_mode:
-        # - 'time': interval in seconds (float)
-        # - 'frame': interval in frames (int)
+        # Frame saving configuration
+        self.save_interval = save_interval  # How often to save frames (time/frame based)
+        self.max_frames = max_frames  # Maximum number of frames to save before stopping
+        self.last_save_time = time.time()  # Track last save time for time-based saving
+        self.saved_frames = 0  # Counter for saved frames
+        
+        # Frame processing tracking
+        self.frame_count = 0  # Total frames processed counter
+        self.last_tensors = None  # Store feature tensors from Hailo inference
+        self.skip_frames = skip_frames  # Skip N frames between processing (0=process all)
+        self.last_process_time = 0  # Track timing for performance monitoring
+        self.processing_times = []  # List to track processing times for averaging
+        
+        # Save mode configuration - determines how saving intervals are calculated
+        self.save_mode = save_mode  # 'time' or 'frame' based saving
+        # save_interval interpretation:
+        # - 'time': interval in seconds (float) - save every N seconds
+        # - 'frame': interval in frames (int) - save every N frames
         self.save_interval = int(save_interval) if save_mode == 'frame' else float(save_interval)
-        self.last_saved_frame_count = 0  # Track last saved frame for frame-based saving
+        self.last_saved_frame_count = 0  # Track last saved frame number for frame-based saving
         
-        # Inference results saving
-        self.save_inference_results = save_inference_results
-        self.inference_output_dir = Path(inference_output_dir)
+        # Inference results saving configuration - saves raw model outputs for analysis
+        self.save_inference_results = save_inference_results  # Enable saving raw inference data
+        self.inference_output_dir = Path(inference_output_dir)  # Directory for .npz files
         if self.save_inference_results:
             self.inference_output_dir.mkdir(exist_ok=True)
-        self.last_inference_save_time = time.time()
+        self.last_inference_save_time = time.time()  # Track timing for inference result saving
         self.last_inference_saved_frame_count = 0  # Track last saved inference frame
-        self.saved_inference_results = 0
+        self.saved_inference_results = 0  # Counter for saved inference result files
         
-        # Initialize Hailo device for direct inference
+        # Initialize Hailo AI accelerator for DINOv2 feature extraction
         if hef_path:
-            self.init_hailo_inference(hef_path)
+            self.init_hailo_inference(hef_path)  # Setup Hailo device with compiled HEF model
         
-        # Initialize MTCNN for face detection
+        # Initialize MTCNN for face detection (runs on CPU)
+        # keep_all=True ensures we detect multiple faces in a frame
         self.mtcnn = MTCNN(keep_all=True, device='cpu')
+        
+        # Print configuration summary
         print(f"Initialized MTCNN face detector")
         print(f"Output frames will be saved to: {self.output_dir}")
         if self.save_mode == 'time':
@@ -106,50 +118,75 @@ class GazeLLECallbackClass(app_callback_class):
             print(f"Inference results will be saved to: {self.inference_output_dir}")
     
     def init_hailo_inference(self, hef_path):
-        """Initialize Hailo device for direct inference"""
+        """
+        Initialize Hailo AI accelerator for DINOv2 backbone inference
+        
+        Sets up the Hailo device with the compiled HEF (Hailo Executable Format) model
+        for accelerated DINOv2 feature extraction. This replaces the PyTorch DINOv2
+        backbone with hardware-accelerated inference.
+        
+        Args:
+            hef_path (str): Path to the compiled .hef model file
+        """
         import hailo_platform as hpf
-        # Create VDevice
+        
+        # Create Virtual Device - represents the Hailo AI processor
         self.vdevice = VDevice()
         
-        # Configure network
-        self.hef = hpf.HEF(hef_path)
+        # Load and configure the compiled neural network model
+        self.hef = hpf.HEF(hef_path)  # Load HEF (Hailo Executable Format) file
         configure_params = ConfigureParams.create_from_hef(self.hef, interface=HailoStreamInterface.PCIe)
         network_group = self.vdevice.configure(self.hef, configure_params)[0]
         
-        # Get input/output info with format type
+        # Setup input/output stream parameters for inference
+        # Input: UINT8 quantized format (0-255 pixel values)
+        # Output: FLOAT32 format for DINOv2 features
         self.input_vstreams_params = InputVStreamParams.make(network_group, quantized=True, format_type=FormatType.UINT8)
         self.output_vstreams_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
             
-        # Create vstreams
+        # Store network group for inference execution
         self.network_group = network_group
         print(f"[DEBUG] Initialized Hailo inference with {len(self.input_vstreams_params)} inputs and {len(self.output_vstreams_params)} outputs")
         
-        # Get and print stream info from HEF
+        # Debug: Print model input/output specifications from HEF file
         input_vstream_info = self.hef.get_input_vstream_infos()
         output_vstream_info = self.hef.get_output_vstream_infos()
         
+        # Display input specifications (image dimensions, data format)
         for info in input_vstream_info:
             print(f"[DEBUG] Input stream: {info.name}, shape: {info.shape}, format: {info.format}")
             
+        # Display output specifications (feature tensor dimensions)
         for info in output_vstream_info:
             print(f"[DEBUG] Output stream: {info.name}, shape: {info.shape}, format: {info.format}")
     
     def run_hailo_inference(self, frame):
-        """Run inference on frame using Hailo device"""
-        # Get input shape from stored info
+        """
+        Run DINOv2 feature extraction on input frame using Hailo accelerator
+        
+        Takes a video frame, preprocesses it for the DINOv2 model, runs inference
+        on the Hailo AI processor, and returns the extracted features.
+        
+        Args:
+            frame (np.ndarray): Input video frame in RGB format [H,W,C]
+            
+        Returns:
+            dict: Dictionary containing feature tensors from DINOv2 backbone
+        """
+        # Get required input dimensions from the compiled model
         input_vstream_info = self.hef.get_input_vstream_infos()[0]
         input_shape = input_vstream_info.shape
         
-        # Determine H,W based on shape length
-        if len(input_shape) == 3:  # HWC format
+        # Extract height and width from shape (handle different tensor formats)
+        if len(input_shape) == 3:  # HWC format (Height, Width, Channels)
             h, w = input_shape[0], input_shape[1]
-        else:  # NHWC format
+        else:  # NHWC format (Batch, Height, Width, Channels)
             h, w = input_shape[1], input_shape[2]
         
-        # Resize frame to model input size
+        # Resize input frame to match model's expected input size
         resized = cv2.resize(frame, (w, h))
         
-        # Debug: Check if cv2.resize changes format
+        # Debug: Check frame format after preprocessing (first inference only)
         if hasattr(self, '_first_inference'):
             if not self._first_inference:
                 print(f"[FORMAT CHECK] After cv2.resize - shape: {resized.shape}, sample pixel: {resized[h//2, w//2]}")
@@ -157,26 +194,54 @@ class GazeLLECallbackClass(app_callback_class):
         else:
             self._first_inference = False
         
-        # No normalization - keep UINT8 values as expected by HEF
-        # The HEF expects UINT8 input in 0-255 range
+        # Keep original UINT8 pixel values (0-255 range) as expected by quantized HEF model
+        # No normalization needed - the compiled model handles quantization internally
         
-        # Run inference
+        # Execute inference on Hailo AI processor
         with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as infer_pipeline:
+            # Prepare input data: add batch dimension [1, H, W, C]
             input_data = {list(self.input_vstreams_params.keys())[0]: np.expand_dims(resized, axis=0)}
             
+            # Activate network and run inference
             with self.network_group.activate(None):
                 infer_results = infer_pipeline.infer(input_data)
                 
         return infer_results
         
     def should_continue(self):
-        """Check if we should continue processing"""
-        # Let the pipeline keep running; limit only the saving
+        """
+        Check if the processing pipeline should continue running
+        
+        Currently always returns True to keep the pipeline running continuously.
+        Frame saving limits are handled separately in the callback function.
+        
+        Returns:
+            bool: True to continue processing, False to stop
+        """
+        # Keep the GStreamer pipeline running continuously
+        # Frame saving is limited separately by max_frames parameter
         return True
 
 
 def gazelle_callback(pad, info, user_data):
-    """Callback function for processing frames with GazeLLE"""
+    """
+    Main GStreamer callback function for real-time gaze estimation
+    
+    This function is called for each video frame in the GStreamer pipeline and performs:
+    1. Frame preprocessing and format conversion
+    2. Face detection using MTCNN
+    3. DINOv2 feature extraction using Hailo accelerator
+    4. Gaze estimation using GazeLLE model
+    5. Result visualization and saving
+    
+    Args:
+        pad: GStreamer pad (pipeline element connection point)
+        info: GStreamer probe info containing the video buffer
+        user_data: GazeLLECallbackClass instance with models and configuration
+        
+    Returns:
+        Gst.PadProbeReturn.OK: Signal to continue pipeline processing
+    """
     user_data.frame_count += 1
     
     # Get buffer and timestamp
@@ -377,7 +442,20 @@ def gazelle_callback(pad, info, user_data):
 
 
 def save_gazelle_frame(frame, boxes, heatmaps, user_data):
-    """Save frame with gaze visualization"""
+    """
+    Save video frame with gaze estimation visualization overlay
+    
+    Creates a visualization showing:
+    - Original video frame
+    - Gaze heatmap overlay (color-coded attention map)
+    - Face bounding boxes with labels
+    
+    Args:
+        frame (np.ndarray): Original video frame [H,W,C]
+        boxes (np.ndarray): Face bounding boxes [N,4] (xmin,ymin,xmax,ymax)
+        heatmaps (np.ndarray): Gaze attention heatmaps [N,H,W]
+        user_data: GazeLLECallbackClass instance with save configuration
+    """
     try:
         # Debug: PIL expects RGB format
         if user_data.saved_frames == 0:
@@ -430,7 +508,21 @@ def save_gazelle_frame(frame, boxes, heatmaps, user_data):
 
 
 def save_inference_results(feat_tensor, boxes, heatmaps, user_data):
-    """Save raw inference results (features, boxes, heatmaps) to disk"""
+    """
+    Save raw inference results to disk for offline analysis
+    
+    Saves all intermediate processing results in compressed NumPy format:
+    - DINOv2 feature tensors from Hailo accelerator
+    - Face bounding boxes from MTCNN
+    - Gaze heatmaps from GazeLLE model
+    - Frame metadata (timestamp, frame number)
+    
+    Args:
+        feat_tensor (torch.Tensor): DINOv2 features [1,C,H,W]
+        boxes (np.ndarray): Face bounding boxes [N,4]
+        heatmaps (np.ndarray): Gaze heatmaps [N,H,W]
+        user_data: GazeLLECallbackClass instance with save configuration
+    """
     try:
         # Create result dictionary
         result_dict = {
@@ -453,7 +545,15 @@ def save_inference_results(feat_tensor, boxes, heatmaps, user_data):
 
 
 def get_gazelle_parser():
-    """Get argument parser with GazeLLE-specific arguments"""
+    """
+    Create command-line argument parser for GazeLLE application
+    
+    Builds upon the default Hailo infrastructure parser and adds
+    GazeLLE-specific configuration options for models, saving, and processing.
+    
+    Returns:
+        argparse.ArgumentParser: Configured argument parser
+    """
     parser = get_default_parser()
     
     # Add GazeLLE-specific arguments
@@ -473,17 +573,26 @@ def get_gazelle_parser():
 
 
 class GStreamerGazeLLEApp(GStreamerApp):
-    """GStreamer application for GazeLLE gaze estimation"""
+    """
+    Main GStreamer application for real-time gaze estimation using GazeLLE
+    
+    This class extends the base GStreamerApp with GazeLLE-specific functionality:
+    - Sets up video capture pipeline with Hailo infrastructure
+    - Configures callback for frame processing
+    - Manages pipeline state and error handling
+    - Supports both live camera and file input
+    """
     
     def __init__(self, args, user_data):
-        # Initialize parent with custom parser
+        """Initialize GStreamer application with GazeLLE-specific configuration"""
+        # Initialize parent GStreamer application
         parser = get_gazelle_parser()
         super().__init__(parser, user_data)
         
-        # Set parameters
+        # Set main processing callback function
         self.app_callback = gazelle_callback
         
-        # Detect architecture if not specified
+        # Auto-detect or use specified Hailo architecture
         if self.options_menu.arch is None:
             detected_arch = detect_hailo_arch()
             if detected_arch is None:
@@ -493,64 +602,85 @@ class GStreamerGazeLLEApp(GStreamerApp):
         else:
             self.arch = self.options_menu.arch
         
-        # Set HEF path
+        # Store HEF model path for Hailo inference
         self.hef_path = self.options_menu.hef
         
-        # Create the pipeline after initialization
+        # Build and initialize the GStreamer pipeline
         self.create_pipeline()
     
     def get_pipeline_string(self):
-        """Build the GStreamer pipeline string"""
-        # Source pipeline
+        """
+        Build the GStreamer pipeline string for video processing
+        
+        Creates a pipeline that:
+        1. Captures video from camera or file
+        2. Processes frames through identity element with callback
+        3. Displays or discards output (headless mode)
+        
+        Returns:
+            str: Complete GStreamer pipeline string
+        """
+        # === Pipeline Components ===
+        
+        # 1. Video input (camera or file source)
         source_pipeline = SOURCE_PIPELINE(
-            self.video_source, 
-            self.video_width, 
-            self.video_height,
-            self.video_format
+            self.video_source,  # Camera device or video file path
+            self.video_width,   # Frame width
+            self.video_height,  # Frame height
+            self.video_format   # Pixel format (RGB, BGR, etc.)
         )
         
-        # User callback - process frames directly
-        # leaky=downstream drops new frames when full (keeps old frames)
-        # leaky=upstream drops old frames when full (keeps new frames) - better for real-time
-        # max-size-buffers=60 provides 2 seconds of buffer at 30fps
+        # 2. Frame processing with callback
+        # Buffer management for real-time processing:
+        # - leaky=downstream: drops new frames when queue is full (preserves old frames)
+        # - max-size-buffers=60: allows 2 seconds of buffering at 30fps
         user_callback_pipeline = (
             f'queue name=hailo_pre_callback_q leaky=downstream max-size-buffers=60 max-size-bytes=0 max-size-time=0 ! '
-            f'identity name=identity_callback '
+            f'identity name=identity_callback '  # Identity element where we attach frame processing callback
         )
         
-        # Display pipeline - use fakesink if headless
+        # 3. Output handling (display or headless)
         if self.options_menu.headless:
+            # Headless mode: discard frames after processing
             display_pipeline = 'fakesink name=hailo_display'
         else:
+            # GUI mode: display processed frames
             display_pipeline = DISPLAY_PIPELINE(
-                video_sink=self.video_sink, 
-                sync=self.sync, 
-                show_fps=self.show_fps
+                video_sink=self.video_sink,  # Display method (autovideosink, etc.)
+                sync=self.sync,              # Synchronize with clock
+                show_fps=self.show_fps       # Show FPS overlay
             )
         
-        # Complete pipeline - simplified without hailonet
+        # === Assemble Complete Pipeline ===
+        # Flow: Source -> Queue -> Processing Callback -> Display/Sink
         pipeline_string = (
-            f'{source_pipeline} ! '
-            f'{QUEUE("pre_callback_q")} ! '
-            f'{user_callback_pipeline} ! '
-            f'{display_pipeline}'
+            f'{source_pipeline} ! '          # Video input
+            f'{QUEUE("pre_callback_q")} ! '   # Buffer queue
+            f'{user_callback_pipeline} ! '   # Frame processing
+            f'{display_pipeline}'            # Output
         )
         
         print(f"Pipeline string: {pipeline_string}")
         return pipeline_string
     
     def setup_callback(self):
-        """Setup the callback on the identity element"""
-        # Get the identity element
+        """
+        Attach frame processing callback to the identity element
+        
+        This method finds the identity element in the pipeline and adds
+        a probe that calls our processing function for each video frame.
+        """
+        # Locate the identity element in the pipeline
         identity = self.pipeline.get_by_name("identity_callback")
         if identity:
-            # Add probe callback
+            # Get the source pad (output) of the identity element
             pad = identity.get_static_pad("src")
             if pad:
+                # Attach our processing callback to intercept each video buffer
                 pad.add_probe(
-                    Gst.PadProbeType.BUFFER,
-                    self.app_callback,
-                    self.user_data
+                    Gst.PadProbeType.BUFFER,  # Trigger on each video buffer
+                    self.app_callback,         # Our processing function
+                    self.user_data            # User data (GazeLLECallbackClass)
                 )
                 print("Callback probe added successfully")
         else:
@@ -559,93 +689,119 @@ class GStreamerGazeLLEApp(GStreamerApp):
         print("[DEBUG] Pipeline state is PLAYING, waiting for frames...")
     
     def on_pipeline_state_changed(self, bus, msg):
-        """Handle pipeline state changes"""
+        """
+        Handle GStreamer pipeline state transitions
+        
+        When the pipeline transitions to PLAYING state, we set up
+        the frame processing callback.
+        
+        Args:
+            bus: GStreamer message bus
+            msg: State change message
+        """
         old_state, new_state, pending = msg.parse_state_changed()
         if msg.src == self.pipeline:
             if new_state == Gst.State.PLAYING:
+                # Pipeline is now running - attach our callback
                 self.setup_callback()
         
-        # Call parent handler
+        # Call parent class handler for other state changes
         super().on_pipeline_state_changed(bus, msg)
 
 
 def main():
-    # Create argument parser with GazeLLE arguments
-    parser = get_gazelle_parser()
+    """
+    Main entry point for real-time GazeLLE gaze estimation application
     
-    # Parse arguments
+    This function:
+    1. Parses command-line arguments
+    2. Loads and configures the GazeLLE model
+    3. Sets up Hailo AI accelerator
+    4. Creates the GStreamer processing pipeline
+    5. Runs the real-time inference loop
+    """
+    # === Command Line Configuration ===
+    parser = get_gazelle_parser()
     args = parser.parse_args()
     
-    # Load GazeLLE model
+    # === Model Loading and Setup ===
     print("Loading GazeLLE model...")
     
-    # Get HEF input dimensions
+    # === Hailo Model Configuration ===
+    # Load HEF (Hailo Executable Format) to get model specifications
     import hailo_platform as hpf
     hef_model = hpf.HEF(args.hef)
     
-    # hef 모델의 입력 정보에 대해서 가져오기
+    # Extract input stream information from compiled model
     input_vs = hef_model.get_input_vstream_infos()
     
-    # 입력 정보가 없으면 오류 출력하고 종료
+    # Validate that model has input specifications
     if not input_vs:
         print("Failed to get HEF input info", file=sys.stderr)
         sys.exit(1)
     
-    
+    # Extract input dimensions from HEF model
     shape = input_vs[0].shape
-    if len(shape) == 3:
+    if len(shape) == 3:  # HWC format
         hef_h, hef_w = shape[0], shape[1]
-    else:
+    else:  # NHWC format
         hef_h, hef_w = shape[1], shape[2]
     print(f"HEF input resolution: {hef_w}x{hef_h}")
     
-    # Create GazeLLE model
+    # === GazeLLE Model Initialization ===
+    # Create DINOv2 backbone (will be replaced by Hailo accelerator)
     backbone = DinoV2Backbone("dinov2_vits14")
+    # Initialize GazeLLE model with input/output dimensions matching HEF
     gazelle_model = GazeLLE(backbone=backbone, in_size=(hef_h, hef_w), out_size=(hef_h, hef_w))
     
-    # Load checkpoint
+    # Load pre-trained GazeLLE weights from checkpoint
     checkpoint = torch.load(args.pth, map_location="cpu")
+    # Handle different checkpoint formats
     if isinstance(checkpoint, dict):
         if "model_state_dict" in checkpoint:
             state_dict = checkpoint["model_state_dict"]
         elif "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
         else:
-            state_dict = checkpoint
+            state_dict = checkpoint  # Assume direct state dict
     else:
         state_dict = checkpoint
     
+    # Load only the head weights (backbone will use Hailo accelerator)
     gazelle_model.load_gazelle_state_dict(state_dict, include_backbone=False)
-    gazelle_model.to(args.device)
-    gazelle_model.eval()
+    gazelle_model.to(args.device)  # Move to specified device (CPU/GPU)
+    gazelle_model.eval()  # Set to evaluation mode
     print("GazeLLE model loaded successfully")
     
-    # Create user data with GazeLLE model
+    # === Application Configuration ===
+    # Create callback handler with all models and configuration
     user_data = GazeLLECallbackClass(
-        gazelle_model=gazelle_model,
-        device=args.device,
-        output_dir=args.output_dir,
-        save_interval=args.save_interval,
-        max_frames=args.max_frames,
-        hef_path=args.hef,
-        skip_frames=args.skip_frames,
-        save_inference_results=args.save_inference,
-        inference_output_dir=args.inference_output_dir,
-        save_mode=args.save_mode
+        gazelle_model=gazelle_model,                    # Loaded GazeLLE model
+        device=args.device,                             # PyTorch device
+        output_dir=args.output_dir,                     # Output directory for visualizations
+        save_interval=args.save_interval,               # Frame/time saving interval
+        max_frames=args.max_frames,                     # Maximum frames to save
+        hef_path=args.hef,                             # Path to Hailo model
+        skip_frames=args.skip_frames,                   # Frame skipping for performance
+        save_inference_results=args.save_inference,     # Save raw inference data
+        inference_output_dir=args.inference_output_dir, # Raw data output directory
+        save_mode=args.save_mode                        # Saving mode (time/frame)
     )
     
-    # Create and run the app
+    # === Application Execution ===
+    # Create GStreamer application with our configuration
     app = GStreamerGazeLLEApp(args, user_data)
     
-    # Add heartbeat to show the app is running
+    # Add periodic status updates (every 5 seconds)
     def heartbeat():
         print(f"[DEBUG] Heartbeat - Frames processed: {user_data.frame_count}")
-        return True
+        return True  # Continue periodic calls
     
     GLib.timeout_add_seconds(5, heartbeat)
     
+    # Start the real-time processing loop
     print("[DEBUG] Starting GStreamer app...")
-    app.run()
+    app.run()  # This blocks until the application is stopped
 
 
 if __name__ == "__main__":
