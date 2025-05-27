@@ -371,32 +371,12 @@ def get_gazelle_detection_parser():
 class GStreamerGazeLLEDetectionApp(GStreamerDetectionApp):
     """GStreamer application for combined GazeLLE gaze estimation and object detection"""
     
-    def __init__(self, args, user_data):
-        # Initialize parent with custom parser
-        parser = get_gazelle_parser()
-        super().__init__(parser, user_data)
+    def __init__(self, app_callback, user_data):
+        # Initialize parent - GStreamerDetectionApp handles pipeline setup
+        super().__init__(app_callback, user_data)
         
-        # Set parameters
-        self.app_callback = gazelle_detection_callback
-        
-        # Detect architecture if not specified
-        if self.options_menu.arch is None:
-            detected_arch = detect_hailo_arch()
-            if detected_arch is None:
-                raise ValueError("Could not auto-detect Hailo architecture")
-            self.arch = detected_arch
-            print(f"Auto-detected Hailo architecture: {self.arch}")
-        else:
-            self.arch = self.options_menu.arch
-        
-        # Set HEF path
-        self.hef_path = self.options_menu.hef
-        
-        # Create the pipeline after initialization
-        self.create_pipeline()
-    
-    # Remove the get_pipeline_string method - parent class handles it
-    # Remove setup_callback and on_pipeline_state_changed - parent class handles them
+        # Set HEF path for detection model (parent class uses --hef)
+        # GazeLLE HEF is handled separately via --gazelle-hef
 
 
 def main():
