@@ -189,8 +189,27 @@ class HailoInferenceManager:
         else:  # NHWC
             h, w = input_shape[1], input_shape[2]
         
+        # Log original frame info
+        if hasattr(self, '_first_frame_logged'):
+            pass
+        else:
+            print(f"[DEBUG] Original frame shape: {frame.shape}, dtype: {frame.dtype}")
+            print(f"[DEBUG] Frame pixel range: min={frame.min()}, max={frame.max()}, mean={frame.mean():.2f}")
+            self._first_frame_logged = True
+        
+        # Store original size and model input size for DETR
+        if isinstance(self, DETRInferenceManager) and self.detr_input_size is None:
+            self.detr_input_size = (h, w)
+        
         # Resize frame
         resized = cv2.resize(frame, (w, h))
+        
+        # Log resized frame info
+        if not hasattr(self, '_resize_logged'):
+            print(f"[DEBUG] Resized from {frame.shape[:2]} to {resized.shape[:2]}")
+            print(f"[DEBUG] Scale factors: x={frame.shape[1]/w:.3f}, y={frame.shape[0]/h:.3f}")
+            print(f"[DEBUG] Resized pixel range: min={resized.min()}, max={resized.max()}, mean={resized.mean():.2f}")
+            self._resize_logged = True
         
         # Run inference
         with InferVStreams(self.network_group, 
@@ -232,6 +251,253 @@ class SCRFDInferenceManager(HailoInferenceManager):
         return detections
 
 
+class DETRInferenceManager(HailoInferenceManager):
+    """Specialized manager for DETR object detection."""
+    
+    def __init__(self, hef_path, vdevice=None):
+        # Call parent class constructor with shared vdevice
+        super().__init__(hef_path, vdevice)
+        # COCO class names for DETR - only the 80 valid classes
+        self.class_names = [
+            'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+            'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
+            'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
+            'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+            'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+            'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+            'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake',
+            'chair', 'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop',
+            'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+            'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+        ]
+        # Only the first 80 COCO classes are valid
+        self.valid_class_ids = list(range(80))
+        # Store original image size and DETR input size for proper scaling
+        self.detr_input_size = None
+    
+    def process_detections(self, outputs, img_width, img_height, threshold=0.6):
+        """Process DETR outputs to get object detections."""
+        detections = []
+        
+        # DETR outputs: conv113 (class logits), conv116 (boxes)
+        boxes_output = None
+        scores_output = None
+        
+        for output_name, output_data in outputs.items():
+            if not hasattr(self, '_output_shapes_logged'):
+                print(f"[DEBUG] DETR output: {output_name}, shape: {output_data.shape}")
+            # Based on your output shapes:
+            # conv116: (1, 1, 100, 4) - boxes
+            # conv113: (1, 1, 100, 92) - class logits
+            if 'conv116' in output_name or (output_data.shape[-1] == 4 and len(output_data.shape) >= 3):
+                boxes_output = output_data
+            elif 'conv113' in output_name or (output_data.shape[-1] > 4 and len(output_data.shape) >= 3):
+                scores_output = output_data
+        
+        if not hasattr(self, '_output_shapes_logged'):
+            self._output_shapes_logged = True
+        
+        if boxes_output is not None and scores_output is not None:
+            # Log raw output ranges
+            if not hasattr(self, '_raw_outputs_logged'):
+                print(f"\n[DEBUG] Raw boxes output range: min={boxes_output.min():.3f}, max={boxes_output.max():.3f}")
+                print(f"[DEBUG] Raw scores output range: min={scores_output.min():.3f}, max={scores_output.max():.3f}")
+                self._raw_outputs_logged = True
+            
+            # Reshape to remove extra dimensions
+            # From (1, 1, 100, 4) to (100, 4)
+            if len(boxes_output.shape) == 4:
+                boxes_output = boxes_output[0, 0]  # Remove batch and extra dim
+            elif len(boxes_output.shape) == 3:
+                boxes_output = boxes_output[0]  # Remove batch
+                
+            # From (1, 1, 100, 92) to (100, 92)
+            if len(scores_output.shape) == 4:
+                scores_output = scores_output[0, 0]  # Remove batch and extra dim
+            elif len(scores_output.shape) == 3:
+                scores_output = scores_output[0]  # Remove batch
+            
+            # Log first few box values to check format
+            if not hasattr(self, '_box_format_logged'):
+                print(f"\n[DEBUG] First 5 boxes (raw):")
+                for i in range(min(5, boxes_output.shape[0])):
+                    print(f"  Box {i}: {boxes_output[i]}")
+                
+                # Check if boxes need sigmoid
+                if boxes_output.min() < 0 or boxes_output.max() > 1:
+                    print(f"[DEBUG] Boxes appear to be logits (range: {boxes_output.min():.3f} to {boxes_output.max():.3f})")
+                    print(f"[DEBUG] Applying sigmoid to boxes...")
+                    boxes_output = 1 / (1 + np.exp(-boxes_output))
+                    print(f"[DEBUG] After sigmoid - range: {boxes_output.min():.3f} to {boxes_output.max():.3f}")
+                    print(f"[DEBUG] First 5 boxes (after sigmoid):")
+                    for i in range(min(5, boxes_output.shape[0])):
+                        print(f"  Box {i}: {boxes_output[i]}")
+                
+                self._box_format_logged = True
+            
+            # Apply sigmoid to boxes if needed (for subsequent frames)
+            if boxes_output.min() < 0 or boxes_output.max() > 1:
+                boxes_output = 1 / (1 + np.exp(-boxes_output))
+            
+            # Apply softmax to get probabilities from logits
+            scores_probs = self._softmax(scores_output, axis=-1)
+            
+            # Log softmax results
+            if not hasattr(self, '_softmax_logged'):
+                print(f"\n[DEBUG] After softmax - max prob: {scores_probs.max():.3f}")
+                print(f"[DEBUG] Top 5 predictions from first query:")
+                top5_idx = np.argsort(scores_probs[0])[-5:][::-1]
+                for idx in top5_idx:
+                    class_name = self.class_names[idx] if idx < len(self.class_names) else f'class_{idx}'
+                    print(f"  {class_name}: {scores_probs[0][idx]:.3f}")
+                self._softmax_logged = True
+            
+            # Process each detection
+            num_queries = min(boxes_output.shape[0], 100)
+            detection_count = 0
+            
+            for i in range(num_queries):
+                box = boxes_output[i]
+                class_probs = scores_probs[i]
+                
+                # Skip background class (usually last class in DETR)
+                # Get best non-background class
+                best_class_idx = np.argmax(class_probs[:-1])  # Exclude last class (background)
+                best_score = class_probs[best_class_idx]
+                
+                # Filter: only valid COCO classes and above threshold
+                if best_score > threshold and best_class_idx in self.valid_class_ids:
+                    # DETR uses center_x, center_y, width, height format (normalized)
+                    cx, cy, w, h = box
+                    
+                    # Get class name safely
+                    if best_class_idx < len(self.class_names):
+                        class_name = self.class_names[best_class_idx]
+                    else:
+                        class_name = f'class_{best_class_idx}'
+                    
+                    # Log first detection details
+                    if detection_count == 0 and not hasattr(self, '_first_detection_logged'):
+                        print(f"\n[DEBUG] First detection details:")
+                        print(f"  Query index: {i}")
+                        print(f"  Box (cx,cy,w,h): {cx:.3f}, {cy:.3f}, {w:.3f}, {h:.3f}")
+                        print(f"  Class: {class_name} (idx={best_class_idx})")
+                        print(f"  Confidence: {best_score:.3f}")
+                        print(f"  DETR input size: {getattr(self, 'detr_input_size', 'unknown')}")
+                        print(f"  Output image size: {img_width}x{img_height}")
+                    
+                    # Convert to corner format
+                    # Box coordinates are normalized to [0,1] on the DETR input size (800x800)
+                    # We need to scale them to the output image size (1280x720)
+                    x1 = (cx - w/2) * img_width
+                    y1 = (cy - h/2) * img_height
+                    x2 = (cx + w/2) * img_width
+                    y2 = (cy + h/2) * img_height
+                    
+                    # Log coordinate conversion
+                    if detection_count == 0 and not hasattr(self, '_first_detection_logged'):
+                        print(f"  Before clamping: x1={x1:.1f}, y1={y1:.1f}, x2={x2:.1f}, y2={y2:.1f}")
+                        print(f"  Image size: {img_width}x{img_height}")
+                    
+                    # Clamp to image bounds
+                    x1 = max(0, min(x1, img_width - 1))
+                    y1 = max(0, min(y1, img_height - 1))
+                    x2 = max(0, min(x2, img_width - 1))
+                    y2 = max(0, min(y2, img_height - 1))
+                    
+                    if detection_count == 0 and not hasattr(self, '_first_detection_logged'):
+                        print(f"  After clamping: x1={x1:.1f}, y1={y1:.1f}, x2={x2:.1f}, y2={y2:.1f}")
+                        self._first_detection_logged = True
+                    
+                    # Convert to int
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    
+                    # Skip very small boxes (likely noise)
+                    box_width = x2 - x1
+                    box_height = y2 - y1
+                    if box_width < 10 or box_height < 10:
+                        continue
+                    
+                    detections.append({
+                        'bbox': [x1, y1, x2, y2],
+                        'class': class_name,
+                        'confidence': float(best_score)
+                    })
+                    detection_count += 1
+        
+        # Apply Non-Maximum Suppression (NMS) to remove duplicates
+        if len(detections) > 0:
+            detections = self._apply_nms(detections, iou_threshold=0.5)
+        
+        if len(detections) > 0 and not hasattr(self, '_detection_summary_logged'):
+            print(f"\n[DEBUG] DETR found {len(detections)} detections (after NMS)")
+            print(f"[DEBUG] Detection summary:")
+            for i, det in enumerate(detections[:5]):  # Show first 5
+                print(f"  {i}: {det['class']} @ [{det['bbox'][0]},{det['bbox'][1]},{det['bbox'][2]},{det['bbox'][3]}] conf={det['confidence']:.3f}")
+            self._detection_summary_logged = True
+        
+        return detections
+    
+    def _apply_nms(self, detections, iou_threshold=0.5):
+        """Apply Non-Maximum Suppression to remove duplicate detections."""
+        if len(detections) == 0:
+            return detections
+        
+        # Sort by confidence (descending)
+        detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)
+        
+        kept_detections = []
+        for det in detections:
+            # Check if this detection overlaps too much with any kept detection
+            should_keep = True
+            for kept in kept_detections:
+                if self._compute_iou(det['bbox'], kept['bbox']) > iou_threshold:
+                    # If same class or very high overlap, suppress
+                    if det['class'] == kept['class'] or self._compute_iou(det['bbox'], kept['bbox']) > 0.7:
+                        should_keep = False
+                        break
+            
+            if should_keep:
+                kept_detections.append(det)
+                # Limit to top 25 detections
+                if len(kept_detections) >= 25:
+                    break
+        
+        return kept_detections
+    
+    def _compute_iou(self, box1, box2):
+        """Compute Intersection over Union (IoU) between two boxes."""
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Calculate intersection area
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i < x1_i or y2_i < y1_i:
+            return 0.0
+        
+        intersection_area = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # Calculate union area
+        box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+        box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union_area = box1_area + box2_area - intersection_area
+        
+        # Compute IoU
+        if union_area == 0:
+            return 0.0
+        
+        return intersection_area / union_area
+    
+    def _softmax(self, x, axis=-1):
+        """Compute softmax values for array x along specified axis."""
+        e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
+        return e_x / np.sum(e_x, axis=axis, keepdims=True)
+
+
 # ============================================================================
 # Frame Processor
 # ============================================================================
@@ -239,15 +505,18 @@ class SCRFDInferenceManager(HailoInferenceManager):
 class FrameProcessor:
     """Handles frame processing logic."""
     
-    def __init__(self, gazelle_model, hailo_manager, device='cpu', scrfd_manager=None):
+    def __init__(self, gazelle_model, hailo_manager, device='cpu', scrfd_manager=None, detr_manager=None):
         self.gazelle_model = gazelle_model
         self.hailo_manager = hailo_manager
         self.scrfd_manager = scrfd_manager
+        self.detr_manager = detr_manager
         self.device = device
         self.mtcnn = MTCNN(keep_all=True, device='cpu')
         print("Initialized MTCNN face detector")
         if self.scrfd_manager:
-            print("Initialized SCRFD object detector")
+            print("Initialized SCRFD face detector")
+        if self.detr_manager:
+            print("Initialized DETR object detector")
     
     def process_frame(self, frame, width, height):
         """Process a single frame and return gaze results."""
@@ -261,14 +530,17 @@ class FrameProcessor:
         feat_tensor = torch.from_numpy(feat_processed).to(self.device)
         
         # Detect faces using SCRFD if available, otherwise use MTCNN
-        object_detections = None
+        face_detections = []
+        object_detections = []
+        
         if self.scrfd_manager:
-            # Run SCRFD for face and object detection
+            # Run SCRFD for face detection
             scrfd_results = self.scrfd_manager.run_inference(frame)
-            object_detections = self.scrfd_manager.process_detections(scrfd_results)
+            scrfd_detections = self.scrfd_manager.process_detections(scrfd_results)
+            face_detections.extend(scrfd_detections)
             
             # Extract face boxes from SCRFD detections
-            face_boxes = [d['bbox'] for d in object_detections if d.get('class') == 'face']
+            face_boxes = [d['bbox'] for d in scrfd_detections if d.get('class') == 'face']
             if face_boxes:
                 boxes = np.array(face_boxes)
             else:
@@ -281,6 +553,15 @@ class FrameProcessor:
         if boxes is None or len(boxes) == 0:
             # Use center region if no faces detected
             boxes = np.array([[width*0.25, height*0.25, width*0.75, height*0.75]])
+        
+        # Run DETR for general object detection if available
+        if self.detr_manager:
+            detr_results = self.detr_manager.run_inference(frame)
+            detr_detections = self.detr_manager.process_detections(detr_results, width, height)
+            object_detections.extend(detr_detections)
+        
+        # Combine all detections
+        all_detections = face_detections + object_detections
         
         # Normalize bounding boxes
         norm_bboxes = normalize_bounding_boxes(boxes, width, height)
@@ -298,7 +579,7 @@ class FrameProcessor:
             'features': feat_tensor,
             'boxes': boxes,
             'heatmaps': heatmaps,
-            'object_detections': object_detections
+            'object_detections': all_detections
         }
 
 
@@ -359,12 +640,21 @@ class ResultSaver:
                     if detection.get('class') != 'face':  # Skip faces as they're already drawn
                         bbox = detection['bbox']
                         xmin, ymin, xmax, ymax = bbox
+                        
+                        # Use different colors for different object types
+                        if 'person' in detection.get('class', '').lower():
+                            color = 'cyan'
+                        elif any(x in detection.get('class', '').lower() for x in ['car', 'truck', 'bus', 'motorcycle']):
+                            color = 'orange'
+                        else:
+                            color = 'yellow'
+                        
                         rect = plt.Rectangle((xmin, ymin), xmax-xmin, ymax-ymin,
-                                           fill=False, edgecolor='yellow', linewidth=2)
+                                           fill=False, edgecolor=color, linewidth=2)
                         ax.add_patch(rect)
                         label = f"{detection['class']} {detection.get('confidence', 0):.2f}"
                         ax.text(xmin, ymin-5, label,
-                               color='yellow', fontsize=10, weight='bold',
+                               color=color, fontsize=10, weight='bold',
                                bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.7))
             
             plt.title(f"Gaze Estimation with Object Detection - Frame {self.saved_frames + 1}")
@@ -477,7 +767,7 @@ class GazeLLECallbackClass(app_callback_class):
     def __init__(self, gazelle_model, device='cpu', output_dir='./output_frames',
                  save_interval=1.0, max_frames=10, hef_path=None, skip_frames=0,
                  save_inference_results=False, inference_output_dir='./inference_results',
-                 save_mode='time', scrfd_hef_path=None):
+                 save_mode='time', scrfd_hef_path=None, detr_hef_path=None):
         super().__init__()
         
         # Configuration
@@ -491,7 +781,8 @@ class GazeLLECallbackClass(app_callback_class):
         if self.hailo_manager:
             shared_vdevice = self.hailo_manager.vdevice
         self.scrfd_manager = SCRFDInferenceManager(scrfd_hef_path, shared_vdevice) if scrfd_hef_path else None
-        self.frame_processor = FrameProcessor(gazelle_model, self.hailo_manager, device, self.scrfd_manager)
+        self.detr_manager = DETRInferenceManager(detr_hef_path, shared_vdevice) if detr_hef_path else None
+        self.frame_processor = FrameProcessor(gazelle_model, self.hailo_manager, device, self.scrfd_manager, self.detr_manager)
         self.result_saver = ResultSaver(output_dir, inference_output_dir if save_inference_results else None)
         self.timing_manager = TimingManager(save_mode, save_interval, skip_frames)
         
@@ -502,7 +793,9 @@ class GazeLLECallbackClass(app_callback_class):
         # Print configuration
         self._print_config(output_dir, save_mode, save_interval, inference_output_dir)
         if scrfd_hef_path:
-            print(f"SCRFD object detection model loaded from: {scrfd_hef_path}")
+            print(f"SCRFD face detection model loaded from: {scrfd_hef_path}")
+        if detr_hef_path:
+            print(f"DETR object detection model loaded from: {detr_hef_path}")
     
     def _print_config(self, output_dir, save_mode, save_interval, inference_output_dir):
         """Print configuration summary."""
@@ -634,7 +927,8 @@ def get_gazelle_parser():
     parser.add_argument("--hef", required=True, help="Path to compiled HEF backbone model file")
     parser.add_argument("--pth", required=True, help="Path to GazeLLE head checkpoint (.pth)")
     parser.add_argument("--device", default="cpu", help="Torch device for GazeLLE head (cpu or cuda)")
-    parser.add_argument("--scrfd-hef", help="Path to SCRFD HEF model for object detection")
+    parser.add_argument("--scrfd-hef", help="Path to SCRFD HEF model for face detection")
+    parser.add_argument("--detr-hef", help="Path to DETR HEF model for object detection")
     
     # Output arguments
     parser.add_argument("--output-dir", default="./output_frames", help="Directory to save output frames")
@@ -798,7 +1092,8 @@ def main():
         save_inference_results=args.save_inference,
         inference_output_dir=args.inference_output_dir,
         save_mode=args.save_mode,
-        scrfd_hef_path=args.scrfd_hef
+        scrfd_hef_path=args.scrfd_hef,
+        detr_hef_path=args.detr_hef
     )
     
     # Create and run application

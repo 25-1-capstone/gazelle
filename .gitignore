@@ -171,4 +171,6 @@ data/gazefollow/
 *.DS_Store*
 *h264
 *mp4
-output_frames
+output_frames/*
+inference_results/
+output_frames/
