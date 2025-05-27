@@ -126,6 +126,60 @@ def find_gaze_point(heatmap):
     return gaze_x, gaze_y
 
 
+def compute_gaze_targets(heatmaps, object_detections, img_width, img_height):
+    """Determine which objects are being gazed at based on heatmap and detections."""
+    gaze_targets = []
+    
+    for heatmap in heatmaps:
+        if heatmap.ndim == 3:
+            heatmap = heatmap.squeeze()
+        
+        # Resize heatmap to match image dimensions if needed
+        if heatmap.shape != (img_height, img_width):
+            heatmap = cv2.resize(heatmap, (img_width, img_height))
+        
+        # Find the object with highest gaze probability
+        best_object = None
+        best_score = 0.0
+        
+        for detection in object_detections:
+            bbox = detection['bbox']
+            x1, y1, x2, y2 = bbox
+            
+            # Extract heatmap region for this bounding box
+            bbox_heatmap = heatmap[y1:y2, x1:x2]
+            
+            if bbox_heatmap.size > 0:
+                # Compute average gaze probability in this box
+                avg_gaze_prob = np.mean(bbox_heatmap)
+                max_gaze_prob = np.max(bbox_heatmap)
+                
+                # Use combination of average and max for robustness
+                combined_score = 0.7 * max_gaze_prob + 0.3 * avg_gaze_prob
+                
+                if combined_score > best_score:
+                    best_score = combined_score
+                    best_object = {
+                        'class': detection['class'],
+                        'confidence': detection['confidence'],
+                        'bbox': bbox,
+                        'gaze_score': combined_score,
+                        'max_gaze_prob': max_gaze_prob,
+                        'avg_gaze_prob': avg_gaze_prob
+                    }
+        
+        # Also get the peak gaze point
+        gaze_x, gaze_y = find_gaze_point(heatmap)
+        
+        gaze_targets.append({
+            'gaze_point': (gaze_x, gaze_y),
+            'gaze_object': best_object,
+            'heatmap_max': np.max(heatmap)
+        })
+    
+    return gaze_targets
+
+
 # ============================================================================
 # Hailo Inference Manager
 # ============================================================================
@@ -575,11 +629,15 @@ class FrameProcessor:
         
         heatmaps = out["heatmap"][0].cpu().numpy()
         
+        # Compute gaze targets
+        gaze_targets = compute_gaze_targets(heatmaps, all_detections, width, height)
+        
         return {
             'features': feat_tensor,
             'boxes': boxes,
             'heatmaps': heatmaps,
-            'object_detections': all_detections
+            'object_detections': all_detections,
+            'gaze_targets': gaze_targets
         }
 
 
@@ -602,7 +660,7 @@ class ResultSaver:
             dirs.append(self.inference_output_dir)
         create_directories(dirs)
     
-    def save_visualization(self, frame, boxes, heatmaps, object_detections=None):
+    def save_visualization(self, frame, boxes, heatmaps, object_detections=None, gaze_targets=None):
         """Save frame with gaze visualization and object detections."""
         try:
             frame_pil = Image.fromarray(frame)
@@ -634,6 +692,13 @@ class ResultSaver:
                        color='lime', fontsize=12, weight='bold',
                        bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.7))
             
+            # Get gazed objects for highlighting
+            gazed_objects = []
+            if gaze_targets:
+                for target in gaze_targets:
+                    if target['gaze_object']:
+                        gazed_objects.append(target['gaze_object'])
+            
             # Draw object detections if available
             if object_detections:
                 for detection in object_detections:
@@ -641,23 +706,62 @@ class ResultSaver:
                         bbox = detection['bbox']
                         xmin, ymin, xmax, ymax = bbox
                         
-                        # Use different colors for different object types
-                        if 'person' in detection.get('class', '').lower():
-                            color = 'cyan'
-                        elif any(x in detection.get('class', '').lower() for x in ['car', 'truck', 'bus', 'motorcycle']):
-                            color = 'orange'
+                        # Check if this object is being gazed at
+                        is_gazed = False
+                        gaze_score = 0
+                        for gazed_obj in gazed_objects:
+                            if (gazed_obj['bbox'] == bbox and 
+                                gazed_obj['class'] == detection['class']):
+                                is_gazed = True
+                                gaze_score = gazed_obj['gaze_score']
+                                break
+                        
+                        # Use different colors and styles for gazed objects
+                        if is_gazed:
+                            linewidth = 4
+                            linestyle = '-'
+                            # Red color for gazed object
+                            color = 'red'
+                            label = f"[GAZE] {detection['class']} {detection.get('confidence', 0):.2f} (gaze: {gaze_score:.2f})"
                         else:
-                            color = 'yellow'
+                            linewidth = 2
+                            linestyle = '--'
+                            # Original color scheme for non-gazed objects
+                            if 'person' in detection.get('class', '').lower():
+                                color = 'cyan'
+                            elif any(x in detection.get('class', '').lower() for x in ['car', 'truck', 'bus', 'motorcycle']):
+                                color = 'orange'
+                            else:
+                                color = 'yellow'
+                            label = f"{detection['class']} {detection.get('confidence', 0):.2f}"
                         
                         rect = plt.Rectangle((xmin, ymin), xmax-xmin, ymax-ymin,
-                                           fill=False, edgecolor=color, linewidth=2)
+                                           fill=False, edgecolor=color, linewidth=linewidth,
+                                           linestyle=linestyle)
                         ax.add_patch(rect)
-                        label = f"{detection['class']} {detection.get('confidence', 0):.2f}"
                         ax.text(xmin, ymin-5, label,
-                               color=color, fontsize=10, weight='bold',
-                               bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.7))
+                               color=color, fontsize=10 if not is_gazed else 12, 
+                               weight='bold',
+                               bbox=dict(boxstyle="round,pad=0.3", 
+                                       facecolor='black' if not is_gazed else 'darkred', 
+                                       alpha=0.7))
             
-            plt.title(f"Gaze Estimation with Object Detection - Frame {self.saved_frames + 1}")
+            # Draw gaze points
+            if gaze_targets:
+                for i, target in enumerate(gaze_targets):
+                    gaze_x, gaze_y = target['gaze_point']
+                    # Draw crosshair at gaze point
+                    ax.plot(gaze_x, gaze_y, 'r+', markersize=20, markeredgewidth=3)
+                    ax.add_patch(plt.Circle((gaze_x, gaze_y), 10, 
+                                          fill=False, edgecolor='red', linewidth=2))
+            
+            # Update title with gaze information
+            title = f"Gaze Estimation - Frame {self.saved_frames + 1}"
+            if gaze_targets and gaze_targets[0]['gaze_object']:
+                gazed_class = gaze_targets[0]['gaze_object']['class']
+                title += f" | Looking at: {gazed_class}"
+            
+            plt.title(title)
             plt.axis('off')
             
             # Save
@@ -666,12 +770,16 @@ class ResultSaver:
             plt.close()
             
             print(f"Saved frame {self.saved_frames + 1} to {output_path}")
+            if gaze_targets and gaze_targets[0]['gaze_object']:
+                print(f"  User is looking at: {gaze_targets[0]['gaze_object']['class']} "
+                      f"(confidence: {gaze_targets[0]['gaze_object']['confidence']:.2f}, "
+                      f"gaze score: {gaze_targets[0]['gaze_object']['gaze_score']:.2f})")
             self.saved_frames += 1
             
         except Exception as e:
             print(f"[DEBUG] Error saving frame: {e}")
     
-    def save_inference_data(self, features, boxes, heatmaps, frame_count, object_detections=None):
+    def save_inference_data(self, features, boxes, heatmaps, frame_count, object_detections=None, gaze_targets=None):
         """Save raw inference results."""
         if not self.inference_output_dir:
             return
@@ -687,6 +795,9 @@ class ResultSaver:
             
             if object_detections:
                 result_dict['object_detections'] = object_detections
+            
+            if gaze_targets:
+                result_dict['gaze_targets'] = gaze_targets
             
             output_path = self.inference_output_dir / f"inference_{self.saved_inference + 1:04d}.npz"
             np.savez_compressed(output_path, **result_dict)
@@ -871,14 +982,16 @@ def gazelle_callback(pad, info, user_data):
         # Save visualizations
         if user_data.timing_manager.should_save_frame(rel_t):
             user_data.result_saver.save_visualization(
-                frame, results['boxes'], results['heatmaps'], results.get('object_detections')
+                frame, results['boxes'], results['heatmaps'], 
+                results.get('object_detections'), results.get('gaze_targets')
             )
         
         # Save inference results
         if user_data.save_inference_results and user_data.timing_manager.should_save_inference(rel_t):
             user_data.result_saver.save_inference_data(
                 results['features'], results['boxes'], results['heatmaps'], 
-                user_data.frame_count, results.get('object_detections')
+                user_data.frame_count, results.get('object_detections'), 
+                results.get('gaze_targets')
             )
             
     except Exception as e:
