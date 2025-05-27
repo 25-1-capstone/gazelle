@@ -133,16 +133,18 @@ def find_gaze_point(heatmap):
 class HailoInferenceManager:
     """Manages Hailo AI accelerator for DINOv2 inference."""
     
-    def __init__(self, hef_path):
+    def __init__(self, hef_path, vdevice=None):
         self.hef_path = hef_path
+        self.vdevice = vdevice
         self._init_device()
     
     def _init_device(self):
         """Initialize Hailo device and load model."""
         import hailo_platform as hpf
         
-        # Create Virtual Device
-        self.vdevice = VDevice()
+        # Create Virtual Device if not provided
+        if self.vdevice is None:
+            self.vdevice = VDevice()
         
         # Load HEF model
         self.hef = hpf.HEF(self.hef_path)
@@ -204,6 +206,32 @@ class HailoInferenceManager:
         return results
 
 
+class SCRFDInferenceManager(HailoInferenceManager):
+    """Specialized manager for SCRFD object detection."""
+    
+    def __init__(self, hef_path, vdevice=None):
+        # Call parent class constructor with shared vdevice
+        super().__init__(hef_path, vdevice)
+    
+    def process_detections(self, outputs, threshold=0.5):
+        """Process SCRFD outputs to get face detections."""
+        # SCRFD typically outputs multiple scales of predictions
+        # This is a simplified version - adjust based on actual model outputs
+        detections = []
+        
+        for output_name, output_data in outputs.items():
+            if 'bbox' in output_name or 'loc' in output_name:
+                # Process bounding box predictions
+                # Shape depends on SCRFD variant
+                continue
+            elif 'conf' in output_name or 'cls' in output_name:
+                # Process confidence scores
+                continue
+        
+        # For now, return empty list - implement based on actual SCRFD output format
+        return detections
+
+
 # ============================================================================
 # Frame Processor
 # ============================================================================
@@ -211,12 +239,15 @@ class HailoInferenceManager:
 class FrameProcessor:
     """Handles frame processing logic."""
     
-    def __init__(self, gazelle_model, hailo_manager, device='cpu'):
+    def __init__(self, gazelle_model, hailo_manager, device='cpu', scrfd_manager=None):
         self.gazelle_model = gazelle_model
         self.hailo_manager = hailo_manager
+        self.scrfd_manager = scrfd_manager
         self.device = device
         self.mtcnn = MTCNN(keep_all=True, device='cpu')
         print("Initialized MTCNN face detector")
+        if self.scrfd_manager:
+            print("Initialized SCRFD object detector")
     
     def process_frame(self, frame, width, height):
         """Process a single frame and return gaze results."""
@@ -229,8 +260,24 @@ class FrameProcessor:
         feat_processed = process_dino_features(feat_raw)
         feat_tensor = torch.from_numpy(feat_processed).to(self.device)
         
-        # Detect faces
-        boxes, probs = self.mtcnn.detect(frame)
+        # Detect faces using SCRFD if available, otherwise use MTCNN
+        object_detections = None
+        if self.scrfd_manager:
+            # Run SCRFD for face and object detection
+            scrfd_results = self.scrfd_manager.run_inference(frame)
+            object_detections = self.scrfd_manager.process_detections(scrfd_results)
+            
+            # Extract face boxes from SCRFD detections
+            face_boxes = [d['bbox'] for d in object_detections if d.get('class') == 'face']
+            if face_boxes:
+                boxes = np.array(face_boxes)
+            else:
+                # Fallback to MTCNN if no faces detected by SCRFD
+                boxes, probs = self.mtcnn.detect(frame)
+        else:
+            # Use MTCNN if SCRFD not available
+            boxes, probs = self.mtcnn.detect(frame)
+        
         if boxes is None or len(boxes) == 0:
             # Use center region if no faces detected
             boxes = np.array([[width*0.25, height*0.25, width*0.75, height*0.75]])
@@ -250,7 +297,8 @@ class FrameProcessor:
         return {
             'features': feat_tensor,
             'boxes': boxes,
-            'heatmaps': heatmaps
+            'heatmaps': heatmaps,
+            'object_detections': object_detections
         }
 
 
@@ -273,8 +321,8 @@ class ResultSaver:
             dirs.append(self.inference_output_dir)
         create_directories(dirs)
     
-    def save_visualization(self, frame, boxes, heatmaps):
-        """Save frame with gaze visualization."""
+    def save_visualization(self, frame, boxes, heatmaps, object_detections=None):
+        """Save frame with gaze visualization and object detections."""
         try:
             frame_pil = Image.fromarray(frame)
             
@@ -305,7 +353,21 @@ class ResultSaver:
                        color='lime', fontsize=12, weight='bold',
                        bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.7))
             
-            plt.title(f"Gaze Estimation - Frame {self.saved_frames + 1}")
+            # Draw object detections if available
+            if object_detections:
+                for detection in object_detections:
+                    if detection.get('class') != 'face':  # Skip faces as they're already drawn
+                        bbox = detection['bbox']
+                        xmin, ymin, xmax, ymax = bbox
+                        rect = plt.Rectangle((xmin, ymin), xmax-xmin, ymax-ymin,
+                                           fill=False, edgecolor='yellow', linewidth=2)
+                        ax.add_patch(rect)
+                        label = f"{detection['class']} {detection.get('confidence', 0):.2f}"
+                        ax.text(xmin, ymin-5, label,
+                               color='yellow', fontsize=10, weight='bold',
+                               bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.7))
+            
+            plt.title(f"Gaze Estimation with Object Detection - Frame {self.saved_frames + 1}")
             plt.axis('off')
             
             # Save
@@ -319,7 +381,7 @@ class ResultSaver:
         except Exception as e:
             print(f"[DEBUG] Error saving frame: {e}")
     
-    def save_inference_data(self, features, boxes, heatmaps, frame_count):
+    def save_inference_data(self, features, boxes, heatmaps, frame_count, object_detections=None):
         """Save raw inference results."""
         if not self.inference_output_dir:
             return
@@ -332,6 +394,9 @@ class ResultSaver:
                 'boxes': boxes,
                 'heatmaps': heatmaps,
             }
+            
+            if object_detections:
+                result_dict['object_detections'] = object_detections
             
             output_path = self.inference_output_dir / f"inference_{self.saved_inference + 1:04d}.npz"
             np.savez_compressed(output_path, **result_dict)
@@ -412,7 +477,7 @@ class GazeLLECallbackClass(app_callback_class):
     def __init__(self, gazelle_model, device='cpu', output_dir='./output_frames',
                  save_interval=1.0, max_frames=10, hef_path=None, skip_frames=0,
                  save_inference_results=False, inference_output_dir='./inference_results',
-                 save_mode='time'):
+                 save_mode='time', scrfd_hef_path=None):
         super().__init__()
         
         # Configuration
@@ -420,9 +485,13 @@ class GazeLLECallbackClass(app_callback_class):
         self.max_frames = max_frames
         self.save_inference_results = save_inference_results
         
-        # Initialize components
-        self.hailo_manager = HailoInferenceManager(hef_path) if hef_path else None
-        self.frame_processor = FrameProcessor(gazelle_model, self.hailo_manager, device)
+        # Initialize components with shared VDevice
+        shared_vdevice = None
+        self.hailo_manager = HailoInferenceManager(hef_path, shared_vdevice) if hef_path else None
+        if self.hailo_manager:
+            shared_vdevice = self.hailo_manager.vdevice
+        self.scrfd_manager = SCRFDInferenceManager(scrfd_hef_path, shared_vdevice) if scrfd_hef_path else None
+        self.frame_processor = FrameProcessor(gazelle_model, self.hailo_manager, device, self.scrfd_manager)
         self.result_saver = ResultSaver(output_dir, inference_output_dir if save_inference_results else None)
         self.timing_manager = TimingManager(save_mode, save_interval, skip_frames)
         
@@ -432,6 +501,8 @@ class GazeLLECallbackClass(app_callback_class):
         
         # Print configuration
         self._print_config(output_dir, save_mode, save_interval, inference_output_dir)
+        if scrfd_hef_path:
+            print(f"SCRFD object detection model loaded from: {scrfd_hef_path}")
     
     def _print_config(self, output_dir, save_mode, save_interval, inference_output_dir):
         """Print configuration summary."""
@@ -506,12 +577,15 @@ def gazelle_callback(pad, info, user_data):
         
         # Save visualizations
         if user_data.timing_manager.should_save_frame(rel_t):
-            user_data.result_saver.save_visualization(frame, results['boxes'], results['heatmaps'])
+            user_data.result_saver.save_visualization(
+                frame, results['boxes'], results['heatmaps'], results.get('object_detections')
+            )
         
         # Save inference results
         if user_data.save_inference_results and user_data.timing_manager.should_save_inference(rel_t):
             user_data.result_saver.save_inference_data(
-                results['features'], results['boxes'], results['heatmaps'], user_data.frame_count
+                results['features'], results['boxes'], results['heatmaps'], 
+                user_data.frame_count, results.get('object_detections')
             )
             
     except Exception as e:
@@ -560,6 +634,7 @@ def get_gazelle_parser():
     parser.add_argument("--hef", required=True, help="Path to compiled HEF backbone model file")
     parser.add_argument("--pth", required=True, help="Path to GazeLLE head checkpoint (.pth)")
     parser.add_argument("--device", default="cpu", help="Torch device for GazeLLE head (cpu or cuda)")
+    parser.add_argument("--scrfd-hef", help="Path to SCRFD HEF model for object detection")
     
     # Output arguments
     parser.add_argument("--output-dir", default="./output_frames", help="Directory to save output frames")
@@ -722,7 +797,8 @@ def main():
         skip_frames=args.skip_frames,
         save_inference_results=args.save_inference,
         inference_output_dir=args.inference_output_dir,
-        save_mode=args.save_mode
+        save_mode=args.save_mode,
+        scrfd_hef_path=args.scrfd_hef
     )
     
     # Create and run application
