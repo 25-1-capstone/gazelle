@@ -308,29 +308,33 @@ class SCRFDInferenceManager(HailoInferenceManager):
 class DETRInferenceManager(HailoInferenceManager):
     """Specialized manager for DETR object detection."""
     
-    def __init__(self, hef_path, vdevice=None):
+    def __init__(self, hef_path, vdevice=None, confidence_threshold=0.7, nms_threshold=0.3):
         # Call parent class constructor with shared vdevice
         super().__init__(hef_path, vdevice)
-        # COCO class names for DETR - only the 80 valid classes
-        self.class_names = [
-            'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
-            'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
-            'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
-            'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
-            'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
-            'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
-            'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake',
-            'chair', 'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop',
-            'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
-            'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
-        ]
-        # Only the first 80 COCO classes are valid
-        self.valid_class_ids = list(range(80))
+        self.confidence_threshold = confidence_threshold
+        self.nms_threshold = nms_threshold
+        # COCO class names for DETR - 91 classes including N/A placeholders
+        # The model outputs 92 logits: 91 object classes (0-90) + 1 "no-object" class (91)
+        self.COCO_CLASSES_91 = [
+            "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+            "traffic light", "fire hydrant", "street sign", "stop sign", "parking meter", "bench",
+            "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
+            "N/A", "backpack", "umbrella", "N/A", "N/A", "handbag", "tie", "suitcase", "frisbee",
+            "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+            "surfboard", "tennis racket", "bottle", "N/A", "wine glass", "cup", "fork", "knife", "spoon",
+            "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza",
+            "donut", "cake", "chair", "couch", "potted plant", "bed", "N/A", "dining table", "N/A", "N/A",
+            "toilet", "N/A", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+            "oven", "toaster", "sink", "refrigerator", "N/A", "book", "clock", "vase", "scissors",
+            "teddy bear", "hair drier", "toothbrush", "N/A"
+        ]  # Length: 91
         # Store original image size and DETR input size for proper scaling
         self.detr_input_size = None
     
-    def process_detections(self, outputs, img_width, img_height, threshold=0.6):
+    def process_detections(self, outputs, img_width, img_height, threshold=None):
         """Process DETR outputs to get object detections."""
+        if threshold is None:
+            threshold = self.confidence_threshold
         detections = []
         
         # DETR outputs: conv113 (class logits), conv116 (boxes)
@@ -396,13 +400,31 @@ class DETRInferenceManager(HailoInferenceManager):
             # Apply softmax to get probabilities from logits
             scores_probs = self._softmax(scores_output, axis=-1)
             
+            # Sanity check for first frame - verify class mapping fix
+            if not hasattr(self, '_sanity_check_logged') and scores_probs.shape[0] > 0:
+                print("\n[DEBUG] Sanity Check - Top predictions for first query (after class mapping fix):")
+                # Get object class probabilities (excluding background at index 91)
+                object_probs = scores_probs[0, :-1]  # Shape: (91,)
+                topk_indices = np.argsort(object_probs)[-5:][::-1]  # Top 5 indices
+                for idx_model in topk_indices:
+                    class_name_check = self.COCO_CLASSES_91[idx_model]
+                    prob_check = object_probs[idx_model]
+                    print(f"  Model Index: {idx_model}, Class: {class_name_check}, Prob: {prob_check:.3f}")
+                self._sanity_check_logged = True
+            
             # Log softmax results
             if not hasattr(self, '_softmax_logged'):
                 print(f"\n[DEBUG] After softmax - max prob: {scores_probs.max():.3f}")
                 print(f"[DEBUG] Top 5 predictions from first query:")
                 top5_idx = np.argsort(scores_probs[0])[-5:][::-1]
                 for idx in top5_idx:
-                    class_name = self.class_names[idx] if idx < len(self.class_names) else f'class_{idx}'
+                    # Handle all 92 classes (91 object classes + 1 background)
+                    if idx < 91:
+                        class_name = self.COCO_CLASSES_91[idx]
+                    elif idx == 91:
+                        class_name = 'background'
+                    else:
+                        class_name = f'class_{idx}'
                     print(f"  {class_name}: {scores_probs[0][idx]:.3f}")
                 self._softmax_logged = True
             
@@ -415,20 +437,22 @@ class DETRInferenceManager(HailoInferenceManager):
                 class_probs = scores_probs[i]
                 
                 # Skip background class (usually last class in DETR)
-                # Get best non-background class
-                best_class_idx = np.argmax(class_probs[:-1])  # Exclude last class (background)
-                best_score = class_probs[best_class_idx]
+                # Get best non-background class from the 91 object classes
+                query_object_probs = class_probs[:-1]  # Exclude last class (background)
+                best_class_idx = np.argmax(query_object_probs)  # Index from 0 to 90
+                best_score = query_object_probs[best_class_idx]
                 
-                # Filter: only valid COCO classes and above threshold
-                if best_score > threshold and best_class_idx in self.valid_class_ids:
+                # Filter: above threshold and not "N/A"
+                if best_score > threshold:
                     # DETR uses center_x, center_y, width, height format (normalized)
                     cx, cy, w, h = box
                     
-                    # Get class name safely
-                    if best_class_idx < len(self.class_names):
-                        class_name = self.class_names[best_class_idx]
-                    else:
-                        class_name = f'class_{best_class_idx}'
+                    # Get class name from the 91-class list
+                    class_name = self.COCO_CLASSES_91[best_class_idx]
+                    
+                    # Skip "N/A" placeholder classes
+                    if class_name == "N/A":
+                        continue
                     
                     # Log first detection details
                     if detection_count == 0 and not hasattr(self, '_first_detection_logged'):
@@ -469,7 +493,15 @@ class DETRInferenceManager(HailoInferenceManager):
                     # Skip very small boxes (likely noise)
                     box_width = x2 - x1
                     box_height = y2 - y1
-                    if box_width < 10 or box_height < 10:
+                    box_area = box_width * box_height
+                    
+                    # Minimum absolute size
+                    if box_width < 20 or box_height < 20:
+                        continue
+                    
+                    # Minimum relative size (0.1% of image area)
+                    min_relative_area = 0.001 * img_width * img_height
+                    if box_area < min_relative_area:
                         continue
                     
                     detections.append({
@@ -481,7 +513,7 @@ class DETRInferenceManager(HailoInferenceManager):
         
         # Apply Non-Maximum Suppression (NMS) to remove duplicates
         if len(detections) > 0:
-            detections = self._apply_nms(detections, iou_threshold=0.5)
+            detections = self._apply_nms(detections, iou_threshold=self.nms_threshold)
         
         if len(detections) > 0 and not hasattr(self, '_detection_summary_logged'):
             print(f"\n[DEBUG] DETR found {len(detections)} detections (after NMS)")
@@ -492,32 +524,46 @@ class DETRInferenceManager(HailoInferenceManager):
         
         return detections
     
-    def _apply_nms(self, detections, iou_threshold=0.5):
+    def _apply_nms(self, detections, iou_threshold=0.3):
         """Apply Non-Maximum Suppression to remove duplicate detections."""
         if len(detections) == 0:
             return detections
         
-        # Sort by confidence (descending)
-        detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)
-        
-        kept_detections = []
+        # Group detections by class for class-specific NMS
+        detections_by_class = {}
         for det in detections:
-            # Check if this detection overlaps too much with any kept detection
-            should_keep = True
-            for kept in kept_detections:
-                if self._compute_iou(det['bbox'], kept['bbox']) > iou_threshold:
-                    # If same class or very high overlap, suppress
-                    if det['class'] == kept['class'] or self._compute_iou(det['bbox'], kept['bbox']) > 0.7:
+            cls = det['class']
+            if cls not in detections_by_class:
+                detections_by_class[cls] = []
+            detections_by_class[cls].append(det)
+        
+        # Apply NMS per class
+        kept_detections = []
+        for cls, class_detections in detections_by_class.items():
+            # Sort by confidence (descending)
+            class_detections = sorted(class_detections, key=lambda x: x['confidence'], reverse=True)
+            
+            # Apply NMS within this class
+            kept_class_detections = []
+            for det in class_detections:
+                # Check if this detection overlaps too much with any kept detection of same class
+                should_keep = True
+                for kept in kept_class_detections:
+                    iou = self._compute_iou(det['bbox'], kept['bbox'])
+                    if iou > iou_threshold:
                         should_keep = False
                         break
+                
+                if should_keep:
+                    kept_class_detections.append(det)
             
-            if should_keep:
-                kept_detections.append(det)
-                # Limit to top 25 detections
-                if len(kept_detections) >= 25:
-                    break
+            kept_detections.extend(kept_class_detections)
         
-        return kept_detections
+        # Sort all kept detections by confidence and limit to top N
+        kept_detections = sorted(kept_detections, key=lambda x: x['confidence'], reverse=True)
+        
+        # Limit to top 20 detections (reduced from 25)
+        return kept_detections[:20]
     
     def _compute_iou(self, box1, box2):
         """Compute Intersection over Union (IoU) between two boxes."""
@@ -878,7 +924,8 @@ class GazeLLECallbackClass(app_callback_class):
     def __init__(self, gazelle_model, device='cpu', output_dir='./output_frames',
                  save_interval=1.0, max_frames=10, hef_path=None, skip_frames=0,
                  save_inference_results=False, inference_output_dir='./inference_results',
-                 save_mode='time', scrfd_hef_path=None, detr_hef_path=None):
+                 save_mode='time', scrfd_hef_path=None, detr_hef_path=None,
+                 detr_confidence=0.7, detr_nms=0.3):
         super().__init__()
         
         # Configuration
@@ -892,7 +939,7 @@ class GazeLLECallbackClass(app_callback_class):
         if self.hailo_manager:
             shared_vdevice = self.hailo_manager.vdevice
         self.scrfd_manager = SCRFDInferenceManager(scrfd_hef_path, shared_vdevice) if scrfd_hef_path else None
-        self.detr_manager = DETRInferenceManager(detr_hef_path, shared_vdevice) if detr_hef_path else None
+        self.detr_manager = DETRInferenceManager(detr_hef_path, shared_vdevice, detr_confidence, detr_nms) if detr_hef_path else None
         self.frame_processor = FrameProcessor(gazelle_model, self.hailo_manager, device, self.scrfd_manager, self.detr_manager)
         self.result_saver = ResultSaver(output_dir, inference_output_dir if save_inference_results else None)
         self.timing_manager = TimingManager(save_mode, save_interval, skip_frames)
@@ -1064,6 +1111,12 @@ def get_gazelle_parser():
     parser.add_argument("--inference-output-dir", default="./inference_results",
                        help="Directory to save inference results")
     
+    # Detection parameters
+    parser.add_argument("--detr-confidence", type=float, default=0.7,
+                       help="Confidence threshold for DETR object detection (default: 0.7)")
+    parser.add_argument("--detr-nms", type=float, default=0.3,
+                       help="NMS IoU threshold for DETR object detection (default: 0.3)")
+    
     return parser
 
 
@@ -1206,7 +1259,9 @@ def main():
         inference_output_dir=args.inference_output_dir,
         save_mode=args.save_mode,
         scrfd_hef_path=args.scrfd_hef,
-        detr_hef_path=args.detr_hef
+        detr_hef_path=args.detr_hef,
+        detr_confidence=args.detr_confidence,
+        detr_nms=args.detr_nms
     )
     
     # Create and run application
