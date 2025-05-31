@@ -313,21 +313,102 @@ class DETRInferenceManager(HailoInferenceManager):
         super().__init__(hef_path, vdevice)
         self.confidence_threshold = confidence_threshold
         self.nms_threshold = nms_threshold
-        # COCO class names for DETR - 91 classes including N/A placeholders
+        print(f"[DEBUG] DETRInferenceManager initialized with confidence_threshold={confidence_threshold}, nms_threshold={nms_threshold}")
+        # COCO class names for DETR - 92 classes including placeholders
         # The model outputs 92 logits: 91 object classes (0-90) + 1 "no-object" class (91)
-        self.COCO_CLASSES_91 = [
-            "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
-            "traffic light", "fire hydrant", "street sign", "stop sign", "parking meter", "bench",
-            "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
-            "N/A", "backpack", "umbrella", "N/A", "N/A", "handbag", "tie", "suitcase", "frisbee",
-            "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
-            "surfboard", "tennis racket", "bottle", "N/A", "wine glass", "cup", "fork", "knife", "spoon",
-            "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza",
-            "donut", "cake", "chair", "couch", "potted plant", "bed", "N/A", "dining table", "N/A", "N/A",
-            "toilet", "N/A", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
-            "oven", "toaster", "sink", "refrigerator", "N/A", "book", "clock", "vase", "scissors",
-            "teddy bear", "hair drier", "toothbrush", "N/A"
-        ]  # Length: 91
+        self.COCO_CLASSES_92 = {
+    0: "unlabeled",
+    1: "person",
+    2: "bicycle",
+    3: "car",
+    4: "motorcycle",
+    5: "airplane",
+    6: "bus",
+    7: "train",
+    8: "truck",
+    9: "boat",
+    10: "traffic",
+    11: "fire",
+    12: "street",
+    13: "stop",
+    14: "parking",
+    15: "bench",
+    16: "bird",
+    17: "cat",
+    18: "dog",
+    19: "horse",
+    20: "sheep",
+    21: "cow",
+    22: "elephant",
+    23: "bear",
+    24: "zebra",
+    25: "giraffe",
+    26: "hat",
+    27: "backpack",
+    28: "umbrella",
+    29: "shoe",
+    30: "eye",
+    31: "handbag",
+    32: "tie",
+    33: "suitcase",
+    34: "frisbee",
+    35: "skis",
+    36: "snowboard",
+    37: "sports",
+    38: "kite",
+    39: "baseball",
+    40: "baseball",
+    41: "skateboard",
+    42: "surfboard",
+    43: "tennis",
+    44: "bottle",
+    45: "plate",
+    46: "wine",
+    47: "cup",
+    48: "fork",
+    49: "knife",
+    50: "spoon",
+    51: "bowl",
+    52: "banana",
+    53: "apple",
+    54: "sandwich",
+    55: "orange",
+    56: "broccoli",
+    57: "carrot",
+    58: "hot",
+    59: "pizza",
+    60: "donut",
+    61: "cake",
+    62: "chair",
+    63: "couch",
+    64: "potted",
+    65: "bed",
+    66: "mirror",
+    67: "dining",
+    68: "window",
+    69: "desk",
+    70: "toilet",
+    71: "door",
+    72: "tv",
+    73: "laptop",
+    74: "mouse",
+    75: "remote",
+    76: "keyboard",
+    77: "cell",
+    78: "microwave",
+    79: "oven",
+    80: "toaster",
+    81: "sink",
+    82: "refrigerator",
+    83: "blender",
+    84: "book",
+    85: "clock",
+    86: "vase",
+    87: "scissors",
+    88: "teddy",
+    89: "hair",
+    90: "toothbrush",
+    91: "hair",}
         # Store original image size and DETR input size for proper scaling
         self.detr_input_size = None
     
@@ -403,12 +484,17 @@ class DETRInferenceManager(HailoInferenceManager):
             # Sanity check for first frame - verify class mapping fix
             if not hasattr(self, '_sanity_check_logged') and scores_probs.shape[0] > 0:
                 print("\n[DEBUG] Sanity Check - Top predictions for first query (after class mapping fix):")
-                # Get object class probabilities (excluding background at index 91)
-                object_probs = scores_probs[0, :-1]  # Shape: (91,)
-                topk_indices = np.argsort(object_probs)[-5:][::-1]  # Top 5 indices
+                # Get all class probabilities including background
+                all_probs = scores_probs[0]  # Shape: (92,)
+                topk_indices = np.argsort(all_probs)[-5:][::-1]  # Top 5 indices
                 for idx_model in topk_indices:
-                    class_name_check = self.COCO_CLASSES_91[idx_model]
-                    prob_check = object_probs[idx_model]
+                    if idx_model < len(self.COCO_CLASSES_92):
+                        class_name_check = self.COCO_CLASSES_92[idx_model]
+                    elif idx_model == 91:
+                        class_name_check = "background/no-object"
+                    else:
+                        class_name_check = f"unknown_class_{idx_model}"
+                    prob_check = all_probs[idx_model]
                     print(f"  Model Index: {idx_model}, Class: {class_name_check}, Prob: {prob_check:.3f}")
                 self._sanity_check_logged = True
             
@@ -419,8 +505,8 @@ class DETRInferenceManager(HailoInferenceManager):
                 top5_idx = np.argsort(scores_probs[0])[-5:][::-1]
                 for idx in top5_idx:
                     # Handle all 92 classes (91 object classes + 1 background)
-                    if idx < 91:
-                        class_name = self.COCO_CLASSES_91[idx]
+                    if idx < len(self.COCO_CLASSES_92):
+                        class_name = self.COCO_CLASSES_92[idx]
                     elif idx == 91:
                         class_name = 'background'
                     else:
@@ -436,22 +522,33 @@ class DETRInferenceManager(HailoInferenceManager):
                 box = boxes_output[i]
                 class_probs = scores_probs[i]
                 
-                # Skip background class (usually last class in DETR)
-                # Get best non-background class from the 91 object classes
-                query_object_probs = class_probs[:-1]  # Exclude last class (background)
-                best_class_idx = np.argmax(query_object_probs)  # Index from 0 to 90
-                best_score = query_object_probs[best_class_idx]
+                # Get best class including background
+                best_class_idx = np.argmax(class_probs)
+                best_score = class_probs[best_class_idx]
                 
-                # Filter: above threshold and not "N/A"
+                # Skip if best class is background (index 91 in DETR output)
+                if best_class_idx == 91:
+                    continue
+                
+                # Filter: above threshold
                 if best_score > threshold:
                     # DETR uses center_x, center_y, width, height format (normalized)
                     cx, cy, w, h = box
                     
-                    # Get class name from the 91-class list
-                    class_name = self.COCO_CLASSES_91[best_class_idx]
+                    # Get class name from the 92-class list, with bounds checking
+                    if best_class_idx < len(self.COCO_CLASSES_92):
+                        class_name = self.COCO_CLASSES_92[best_class_idx]
+                    else:
+                        # Unknown class index - skip this detection
+                        if not hasattr(self, '_unknown_classes_logged'):
+                            self._unknown_classes_logged = set()
+                        if best_class_idx not in self._unknown_classes_logged:
+                            print(f"[DEBUG] Warning: Unknown class index {best_class_idx} detected (confidence: {best_score:.3f})")
+                            self._unknown_classes_logged.add(best_class_idx)
+                        continue
                     
-                    # Skip "N/A" placeholder classes
-                    if class_name == "N/A":
+                    # Skip "N/A" placeholder classes or background
+                    if class_name == "N/A" or class_name == "__background__":
                         continue
                     
                     # Log first detection details
@@ -471,6 +568,15 @@ class DETRInferenceManager(HailoInferenceManager):
                     y1 = (cy - h/2) * img_height
                     x2 = (cx + w/2) * img_width
                     y2 = (cy + h/2) * img_height
+                    
+                    # Debug: Check for suspiciously large or small boxes
+                    if not hasattr(self, '_box_size_logged'):
+                        box_w = x2 - x1
+                        box_h = y2 - y1
+                        if box_w > img_width * 0.8 or box_h > img_height * 0.8:
+                            print(f"[DEBUG] WARNING: Very large box detected - width={box_w:.1f} ({box_w/img_width*100:.1f}%), height={box_h:.1f} ({box_h/img_height*100:.1f}%)")
+                            print(f"  Original: cx={cx:.3f}, cy={cy:.3f}, w={w:.3f}, h={h:.3f}")
+                        self._box_size_logged = True
                     
                     # Log coordinate conversion
                     if detection_count == 0 and not hasattr(self, '_first_detection_logged'):
@@ -513,7 +619,19 @@ class DETRInferenceManager(HailoInferenceManager):
         
         # Apply Non-Maximum Suppression (NMS) to remove duplicates
         if len(detections) > 0:
+            num_before_nms = len(detections)
             detections = self._apply_nms(detections, iou_threshold=self.nms_threshold)
+            num_after_nms = len(detections)
+            
+            # Log NMS results for every frame (or every N frames)
+            if not hasattr(self, '_nms_frame_count'):
+                self._nms_frame_count = 0
+            self._nms_frame_count += 1
+            
+            # Log every 10th frame or first frame
+            if self._nms_frame_count == 1 or self._nms_frame_count % 10 == 0:
+                print(f"\n[DEBUG] Frame {self._nms_frame_count} - NMS: {num_before_nms} -> {num_after_nms} detections (removed {num_before_nms - num_after_nms})")
+                print(f"[DEBUG] NMS threshold: {self.nms_threshold}")
         
         if len(detections) > 0 and not hasattr(self, '_detection_summary_logged'):
             print(f"\n[DEBUG] DETR found {len(detections)} detections (after NMS)")
@@ -529,6 +647,20 @@ class DETRInferenceManager(HailoInferenceManager):
         if len(detections) == 0:
             return detections
         
+        # Debug: Log initial state for first few frames
+        if not hasattr(self, '_nms_debug_count'):
+            self._nms_debug_count = 0
+        self._nms_debug_count += 1
+        
+        if self._nms_debug_count <= 3:  # Debug first 3 frames
+            print(f"\n[DEBUG] _apply_nms called with {len(detections)} detections, iou_threshold={iou_threshold}")
+            # Show class distribution
+            class_counts = {}
+            for det in detections:
+                cls = det['class']
+                class_counts[cls] = class_counts.get(cls, 0) + 1
+            print(f"[DEBUG] Detection distribution: {class_counts}")
+        
         # Group detections by class for class-specific NMS
         detections_by_class = {}
         for det in detections:
@@ -537,27 +669,59 @@ class DETRInferenceManager(HailoInferenceManager):
                 detections_by_class[cls] = []
             detections_by_class[cls].append(det)
         
+        # Debug: Log class distribution
+        if not hasattr(self, '_nms_class_dist_logged'):
+            print(f"[DEBUG] Detection distribution by class:")
+            for cls, dets in detections_by_class.items():
+                print(f"  {cls}: {len(dets)} detections")
+            self._nms_class_dist_logged = True
+        
         # Apply NMS per class
         kept_detections = []
+        nms_stats = {}  # Track removals per class
+        
         for cls, class_detections in detections_by_class.items():
             # Sort by confidence (descending)
             class_detections = sorted(class_detections, key=lambda x: x['confidence'], reverse=True)
             
             # Apply NMS within this class
             kept_class_detections = []
-            for det in class_detections:
+            removed_count = 0
+            
+            for i, det in enumerate(class_detections):
                 # Check if this detection overlaps too much with any kept detection of same class
                 should_keep = True
-                for kept in kept_class_detections:
+                for j, kept in enumerate(kept_class_detections):
                     iou = self._compute_iou(det['bbox'], kept['bbox'])
+                    
+                    # Debug: Log high IoU cases
+                    if iou > 0.1 and not hasattr(self, f'_nms_iou_logged_{cls}'):
+                        print(f"[DEBUG] Class '{cls}' - IoU between detection {i} (conf={det['confidence']:.3f}) and kept {j} (conf={kept['confidence']:.3f}): {iou:.3f}")
+                        if iou > iou_threshold:
+                            print(f"  -> Detection {i} will be REMOVED (IoU {iou:.3f} > threshold {iou_threshold})")
+                        setattr(self, f'_nms_iou_logged_{cls}', True)
+                    
                     if iou > iou_threshold:
                         should_keep = False
+                        removed_count += 1
                         break
                 
                 if should_keep:
                     kept_class_detections.append(det)
             
+            nms_stats[cls] = {'original': len(class_detections), 'kept': len(kept_class_detections), 'removed': removed_count}
             kept_detections.extend(kept_class_detections)
+        
+        # Debug: Log NMS statistics for first few frames
+        if not hasattr(self, '_nms_stats_count'):
+            self._nms_stats_count = 0
+        self._nms_stats_count += 1
+        
+        if self._nms_stats_count <= 3:
+            print(f"\n[DEBUG] NMS statistics for frame {self._nms_stats_count}:")
+            for cls, stats in nms_stats.items():
+                if stats['removed'] > 0:
+                    print(f"  {cls}: {stats['original']} -> {stats['kept']} (removed {stats['removed']})")
         
         # Sort all kept detections by confidence and limit to top N
         kept_detections = sorted(kept_detections, key=lambda x: x['confidence'], reverse=True)
@@ -569,6 +733,11 @@ class DETRInferenceManager(HailoInferenceManager):
         """Compute Intersection over Union (IoU) between two boxes."""
         x1_1, y1_1, x2_1, y2_1 = box1
         x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Debug: Check for suspicious box coordinates
+        if not hasattr(self, '_iou_debug_count'):
+            self._iou_debug_count = 0
+        self._iou_debug_count += 1
         
         # Calculate intersection area
         x1_i = max(x1_1, x1_2)
@@ -586,11 +755,24 @@ class DETRInferenceManager(HailoInferenceManager):
         box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
         union_area = box1_area + box2_area - intersection_area
         
+        # Debug: Log suspicious boxes or high IoU values for first few calculations
+        if self._iou_debug_count <= 10:
+            if box1_area > 50000 or box2_area > 50000:  # Large boxes (might indicate coordinate issues)
+                print(f"[DEBUG] Large box detected: box1_area={box1_area:.1f}, box2_area={box2_area:.1f}")
+                print(f"  box1: [{x1_1:.1f},{y1_1:.1f},{x2_1:.1f},{y2_1:.1f}]")
+                print(f"  box2: [{x1_2:.1f},{y1_2:.1f},{x2_2:.1f},{y2_2:.1f}]")
+        
         # Compute IoU
         if union_area == 0:
             return 0.0
         
-        return intersection_area / union_area
+        iou = intersection_area / union_area
+        
+        # Debug: Log IoU calculations for first few frames
+        if self._iou_debug_count <= 5 and iou > 0.1:
+            print(f"[DEBUG] IoU={iou:.3f} (intersection={intersection_area:.1f}, union={union_area:.1f})")
+        
+        return iou
     
     def _softmax(self, x, axis=-1):
         """Compute softmax values for array x along specified axis."""
@@ -725,10 +907,13 @@ class ResultSaver:
             # Create visualization
             plt.figure(figsize=(10, 8))
             plt.imshow(frame_pil)
-            plt.imshow(heatmap_norm, alpha=0.4, cmap='jet')
+            # Reduce heatmap opacity to ensure objects are visible
+            plt.imshow(heatmap_norm, alpha=0.3, cmap='jet')
             
-            # Draw bounding boxes
+            # Get current axes for drawing
             ax = plt.gca()
+            
+            # Draw face bounding boxes
             for i, bbox in enumerate(boxes):
                 xmin, ymin, xmax, ymax = bbox
                 rect = plt.Rectangle((xmin, ymin), xmax-xmin, ymax-ymin,
@@ -747,6 +932,13 @@ class ResultSaver:
             
             # Draw object detections if available
             if object_detections:
+                # Debug: Print what we're about to draw
+                non_face_detections = [d for d in object_detections if d.get('class') != 'face']
+                if non_face_detections:
+                    print(f"[DEBUG] Drawing {len(non_face_detections)} object detections")
+                    for i, d in enumerate(non_face_detections[:3]):
+                        print(f"  - {d['class']} at [{d['bbox'][0]}, {d['bbox'][1]}, {d['bbox'][2]}, {d['bbox'][3]}]")
+                
                 for detection in object_detections:
                     if detection.get('class') != 'face':  # Skip faces as they're already drawn
                         bbox = detection['bbox']
@@ -764,19 +956,23 @@ class ResultSaver:
                         
                         # Use different colors and styles for gazed objects
                         if is_gazed:
-                            linewidth = 4
+                            linewidth = 5
                             linestyle = '-'
                             # Red color for gazed object
                             color = 'red'
                             label = f"[GAZE] {detection['class']} {detection.get('confidence', 0):.2f} (gaze: {gaze_score:.2f})"
                         else:
-                            linewidth = 2
-                            linestyle = '--'
-                            # Original color scheme for non-gazed objects
+                            linewidth = 3
+                            linestyle = '-'  # Changed from '--' to '-' for solid lines
+                            # More visible color scheme
                             if 'person' in detection.get('class', '').lower():
                                 color = 'cyan'
-                            elif any(x in detection.get('class', '').lower() for x in ['car', 'truck', 'bus', 'motorcycle']):
+                            elif any(x in detection.get('class', '').lower() for x in ['chair', 'couch', 'bed']):
                                 color = 'orange'
+                            elif any(x in detection.get('class', '').lower() for x in ['mouse', 'keyboard', 'laptop', 'tv']):
+                                color = 'magenta'
+                            elif 'plant' in detection.get('class', '').lower():
+                                color = 'green'
                             else:
                                 color = 'yellow'
                             label = f"{detection['class']} {detection.get('confidence', 0):.2f}"
@@ -785,7 +981,10 @@ class ResultSaver:
                                            fill=False, edgecolor=color, linewidth=linewidth,
                                            linestyle=linestyle)
                         ax.add_patch(rect)
-                        ax.text(xmin, ymin-5, label,
+                        
+                        # Draw text label
+                        text_y = ymin-5 if ymin > 20 else ymax+20  # Adjust text position if too close to top
+                        ax.text(xmin, text_y, label,
                                color=color, fontsize=10 if not is_gazed else 12, 
                                weight='bold',
                                bbox=dict(boxstyle="round,pad=0.3", 
@@ -809,6 +1008,9 @@ class ResultSaver:
             
             plt.title(title)
             plt.axis('off')
+            
+            # Force redraw to ensure all patches are rendered
+            plt.draw()
             
             # Save
             output_path = self.output_dir / f"frame_{self.saved_frames + 1:04d}.png"
