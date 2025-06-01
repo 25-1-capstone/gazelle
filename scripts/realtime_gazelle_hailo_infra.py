@@ -98,8 +98,6 @@ def get_hef_input_dimensions(hef_model):
 
 def process_dino_features(feat_raw):
     """Process raw DINOv2 features into correct tensor format."""
-    print(f"[DEBUG] Raw feature shape from Hailo: {feat_raw.shape}")
-    
     if feat_raw.ndim == 3:
         # [H, W, C] -> [1, C, H, W]
         feat_processed = np.transpose(feat_raw, (2, 0, 1))
@@ -114,7 +112,6 @@ def process_dino_features(feat_raw):
     else:
         raise ValueError(f"Unexpected feature shape: {feat_raw.shape}")
     
-    print(f"[DEBUG] Processed feature shape: {feat_processed.shape}")
     return feat_processed
 
 
@@ -220,17 +217,7 @@ class HailoInferenceManager:
     
     def _print_model_info(self):
         """Print model input/output specifications."""
-        print(f"[DEBUG] Initialized Hailo inference with "
-              f"{len(self.input_vstreams_params)} inputs and "
-              f"{len(self.output_vstreams_params)} outputs")
-        
-        # Print input info
-        for info in self.hef.get_input_vstream_infos():
-            print(f"[DEBUG] Input: {info.name}, shape: {info.shape}, format: {info.format}")
-        
-        # Print output info
-        for info in self.hef.get_output_vstream_infos():
-            print(f"[DEBUG] Output: {info.name}, shape: {info.shape}, format: {info.format}")
+        pass
     
     def run_inference(self, frame):
         """Run inference on input frame."""
@@ -243,27 +230,12 @@ class HailoInferenceManager:
         else:  # NHWC
             h, w = input_shape[1], input_shape[2]
         
-        # Log original frame info
-        if hasattr(self, '_first_frame_logged'):
-            pass
-        else:
-            print(f"[DEBUG] Original frame shape: {frame.shape}, dtype: {frame.dtype}")
-            print(f"[DEBUG] Frame pixel range: min={frame.min()}, max={frame.max()}, mean={frame.mean():.2f}")
-            self._first_frame_logged = True
-        
         # Store original size and model input size for DETR
         if isinstance(self, DETRInferenceManager) and self.detr_input_size is None:
             self.detr_input_size = (h, w)
         
         # Resize frame
         resized = cv2.resize(frame, (w, h))
-        
-        # Log resized frame info
-        if not hasattr(self, '_resize_logged'):
-            print(f"[DEBUG] Resized from {frame.shape[:2]} to {resized.shape[:2]}")
-            print(f"[DEBUG] Scale factors: x={frame.shape[1]/w:.3f}, y={frame.shape[0]/h:.3f}")
-            print(f"[DEBUG] Resized pixel range: min={resized.min()}, max={resized.max()}, mean={resized.mean():.2f}")
-            self._resize_logged = True
         
         # Run inference
         with InferVStreams(self.network_group, 
@@ -313,7 +285,6 @@ class DETRInferenceManager(HailoInferenceManager):
         super().__init__(hef_path, vdevice)
         self.confidence_threshold = confidence_threshold
         self.nms_threshold = nms_threshold
-        print(f"[DEBUG] DETRInferenceManager initialized with confidence_threshold={confidence_threshold}, nms_threshold={nms_threshold}")
         # COCO class names for DETR - 92 classes including placeholders
         # The model outputs 92 logits: 91 object classes (0-90) + 1 "no-object" class (91)
         self.COCO_CLASSES_92 = {
@@ -423,8 +394,6 @@ class DETRInferenceManager(HailoInferenceManager):
         scores_output = None
         
         for output_name, output_data in outputs.items():
-            if not hasattr(self, '_output_shapes_logged'):
-                print(f"[DEBUG] DETR output: {output_name}, shape: {output_data.shape}")
             # Based on your output shapes:
             # conv116: (1, 1, 100, 4) - boxes
             # conv113: (1, 1, 100, 92) - class logits
@@ -433,15 +402,7 @@ class DETRInferenceManager(HailoInferenceManager):
             elif 'conv113' in output_name or (output_data.shape[-1] > 4 and len(output_data.shape) >= 3):
                 scores_output = output_data
         
-        if not hasattr(self, '_output_shapes_logged'):
-            self._output_shapes_logged = True
-        
         if boxes_output is not None and scores_output is not None:
-            # Log raw output ranges
-            if not hasattr(self, '_raw_outputs_logged'):
-                print(f"\n[DEBUG] Raw boxes output range: min={boxes_output.min():.3f}, max={boxes_output.max():.3f}")
-                print(f"[DEBUG] Raw scores output range: min={scores_output.min():.3f}, max={scores_output.max():.3f}")
-                self._raw_outputs_logged = True
             
             # Reshape to remove extra dimensions
             # From (1, 1, 100, 4) to (100, 4)
@@ -456,63 +417,13 @@ class DETRInferenceManager(HailoInferenceManager):
             elif len(scores_output.shape) == 3:
                 scores_output = scores_output[0]  # Remove batch
             
-            # Log first few box values to check format
-            if not hasattr(self, '_box_format_logged'):
-                print(f"\n[DEBUG] First 5 boxes (raw):")
-                for i in range(min(5, boxes_output.shape[0])):
-                    print(f"  Box {i}: {boxes_output[i]}")
-                
-                # Check if boxes need sigmoid
-                if boxes_output.min() < 0 or boxes_output.max() > 1:
-                    print(f"[DEBUG] Boxes appear to be logits (range: {boxes_output.min():.3f} to {boxes_output.max():.3f})")
-                    print(f"[DEBUG] Applying sigmoid to boxes...")
-                    boxes_output = 1 / (1 + np.exp(-boxes_output))
-                    print(f"[DEBUG] After sigmoid - range: {boxes_output.min():.3f} to {boxes_output.max():.3f}")
-                    print(f"[DEBUG] First 5 boxes (after sigmoid):")
-                    for i in range(min(5, boxes_output.shape[0])):
-                        print(f"  Box {i}: {boxes_output[i]}")
-                
-                self._box_format_logged = True
-            
-            # Apply sigmoid to boxes if needed (for subsequent frames)
+            # Apply sigmoid to boxes if needed
             if boxes_output.min() < 0 or boxes_output.max() > 1:
                 boxes_output = 1 / (1 + np.exp(-boxes_output))
             
             # Apply softmax to get probabilities from logits
             scores_probs = self._softmax(scores_output, axis=-1)
             
-            # Sanity check for first frame - verify class mapping fix
-            if not hasattr(self, '_sanity_check_logged') and scores_probs.shape[0] > 0:
-                print("\n[DEBUG] Sanity Check - Top predictions for first query (after class mapping fix):")
-                # Get all class probabilities including background
-                all_probs = scores_probs[0]  # Shape: (92,)
-                topk_indices = np.argsort(all_probs)[-5:][::-1]  # Top 5 indices
-                for idx_model in topk_indices:
-                    if idx_model < len(self.COCO_CLASSES_92):
-                        class_name_check = self.COCO_CLASSES_92[idx_model]
-                    elif idx_model == 91:
-                        class_name_check = "background/no-object"
-                    else:
-                        class_name_check = f"unknown_class_{idx_model}"
-                    prob_check = all_probs[idx_model]
-                    print(f"  Model Index: {idx_model}, Class: {class_name_check}, Prob: {prob_check:.3f}")
-                self._sanity_check_logged = True
-            
-            # Log softmax results
-            if not hasattr(self, '_softmax_logged'):
-                print(f"\n[DEBUG] After softmax - max prob: {scores_probs.max():.3f}")
-                print(f"[DEBUG] Top 5 predictions from first query:")
-                top5_idx = np.argsort(scores_probs[0])[-5:][::-1]
-                for idx in top5_idx:
-                    # Handle all 92 classes (91 object classes + 1 background)
-                    if idx < len(self.COCO_CLASSES_92):
-                        class_name = self.COCO_CLASSES_92[idx]
-                    elif idx == 91:
-                        class_name = 'background'
-                    else:
-                        class_name = f'class_{idx}'
-                    print(f"  {class_name}: {scores_probs[0][idx]:.3f}")
-                self._softmax_logged = True
             
             # Process each detection
             num_queries = min(boxes_output.shape[0], 100)
@@ -551,15 +462,6 @@ class DETRInferenceManager(HailoInferenceManager):
                     if class_name == "N/A" or class_name == "__background__":
                         continue
                     
-                    # Log first detection details
-                    if detection_count == 0 and not hasattr(self, '_first_detection_logged'):
-                        print(f"\n[DEBUG] First detection details:")
-                        print(f"  Query index: {i}")
-                        print(f"  Box (cx,cy,w,h): {cx:.3f}, {cy:.3f}, {w:.3f}, {h:.3f}")
-                        print(f"  Class: {class_name} (idx={best_class_idx})")
-                        print(f"  Confidence: {best_score:.3f}")
-                        print(f"  DETR input size: {getattr(self, 'detr_input_size', 'unknown')}")
-                        print(f"  Output image size: {img_width}x{img_height}")
                     
                     # Convert to corner format
                     # Box coordinates are normalized to [0,1] on the DETR input size (800x800)
@@ -569,19 +471,6 @@ class DETRInferenceManager(HailoInferenceManager):
                     x2 = (cx + w/2) * img_width
                     y2 = (cy + h/2) * img_height
                     
-                    # Debug: Check for suspiciously large or small boxes
-                    if not hasattr(self, '_box_size_logged'):
-                        box_w = x2 - x1
-                        box_h = y2 - y1
-                        if box_w > img_width * 0.8 or box_h > img_height * 0.8:
-                            print(f"[DEBUG] WARNING: Very large box detected - width={box_w:.1f} ({box_w/img_width*100:.1f}%), height={box_h:.1f} ({box_h/img_height*100:.1f}%)")
-                            print(f"  Original: cx={cx:.3f}, cy={cy:.3f}, w={w:.3f}, h={h:.3f}")
-                        self._box_size_logged = True
-                    
-                    # Log coordinate conversion
-                    if detection_count == 0 and not hasattr(self, '_first_detection_logged'):
-                        print(f"  Before clamping: x1={x1:.1f}, y1={y1:.1f}, x2={x2:.1f}, y2={y2:.1f}")
-                        print(f"  Image size: {img_width}x{img_height}")
                     
                     # Clamp to image bounds
                     x1 = max(0, min(x1, img_width - 1))
@@ -589,9 +478,6 @@ class DETRInferenceManager(HailoInferenceManager):
                     x2 = max(0, min(x2, img_width - 1))
                     y2 = max(0, min(y2, img_height - 1))
                     
-                    if detection_count == 0 and not hasattr(self, '_first_detection_logged'):
-                        print(f"  After clamping: x1={x1:.1f}, y1={y1:.1f}, x2={x2:.1f}, y2={y2:.1f}")
-                        self._first_detection_logged = True
                     
                     # Convert to int
                     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
@@ -623,22 +509,7 @@ class DETRInferenceManager(HailoInferenceManager):
             detections = self._apply_nms(detections, iou_threshold=self.nms_threshold)
             num_after_nms = len(detections)
             
-            # Log NMS results for every frame (or every N frames)
-            if not hasattr(self, '_nms_frame_count'):
-                self._nms_frame_count = 0
-            self._nms_frame_count += 1
-            
-            # Log every 10th frame or first frame
-            if self._nms_frame_count == 1 or self._nms_frame_count % 10 == 0:
-                print(f"\n[DEBUG] Frame {self._nms_frame_count} - NMS: {num_before_nms} -> {num_after_nms} detections (removed {num_before_nms - num_after_nms})")
-                print(f"[DEBUG] NMS threshold: {self.nms_threshold}")
         
-        if len(detections) > 0 and not hasattr(self, '_detection_summary_logged'):
-            print(f"\n[DEBUG] DETR found {len(detections)} detections (after NMS)")
-            print(f"[DEBUG] Detection summary:")
-            for i, det in enumerate(detections[:5]):  # Show first 5
-                print(f"  {i}: {det['class']} @ [{det['bbox'][0]},{det['bbox'][1]},{det['bbox'][2]},{det['bbox'][3]}] conf={det['confidence']:.3f}")
-            self._detection_summary_logged = True
         
         return detections
     
@@ -647,19 +518,6 @@ class DETRInferenceManager(HailoInferenceManager):
         if len(detections) == 0:
             return detections
         
-        # Debug: Log initial state for first few frames
-        if not hasattr(self, '_nms_debug_count'):
-            self._nms_debug_count = 0
-        self._nms_debug_count += 1
-        
-        if self._nms_debug_count <= 3:  # Debug first 3 frames
-            print(f"\n[DEBUG] _apply_nms called with {len(detections)} detections, iou_threshold={iou_threshold}")
-            # Show class distribution
-            class_counts = {}
-            for det in detections:
-                cls = det['class']
-                class_counts[cls] = class_counts.get(cls, 0) + 1
-            print(f"[DEBUG] Detection distribution: {class_counts}")
         
         # Group detections by class for class-specific NMS
         detections_by_class = {}
@@ -669,12 +527,6 @@ class DETRInferenceManager(HailoInferenceManager):
                 detections_by_class[cls] = []
             detections_by_class[cls].append(det)
         
-        # Debug: Log class distribution
-        if not hasattr(self, '_nms_class_dist_logged'):
-            print(f"[DEBUG] Detection distribution by class:")
-            for cls, dets in detections_by_class.items():
-                print(f"  {cls}: {len(dets)} detections")
-            self._nms_class_dist_logged = True
         
         # Apply NMS per class
         kept_detections = []
@@ -694,12 +546,6 @@ class DETRInferenceManager(HailoInferenceManager):
                 for j, kept in enumerate(kept_class_detections):
                     iou = self._compute_iou(det['bbox'], kept['bbox'])
                     
-                    # Debug: Log high IoU cases
-                    if iou > 0.1 and not hasattr(self, f'_nms_iou_logged_{cls}'):
-                        print(f"[DEBUG] Class '{cls}' - IoU between detection {i} (conf={det['confidence']:.3f}) and kept {j} (conf={kept['confidence']:.3f}): {iou:.3f}")
-                        if iou > iou_threshold:
-                            print(f"  -> Detection {i} will be REMOVED (IoU {iou:.3f} > threshold {iou_threshold})")
-                        setattr(self, f'_nms_iou_logged_{cls}', True)
                     
                     if iou > iou_threshold:
                         should_keep = False
@@ -712,16 +558,6 @@ class DETRInferenceManager(HailoInferenceManager):
             nms_stats[cls] = {'original': len(class_detections), 'kept': len(kept_class_detections), 'removed': removed_count}
             kept_detections.extend(kept_class_detections)
         
-        # Debug: Log NMS statistics for first few frames
-        if not hasattr(self, '_nms_stats_count'):
-            self._nms_stats_count = 0
-        self._nms_stats_count += 1
-        
-        if self._nms_stats_count <= 3:
-            print(f"\n[DEBUG] NMS statistics for frame {self._nms_stats_count}:")
-            for cls, stats in nms_stats.items():
-                if stats['removed'] > 0:
-                    print(f"  {cls}: {stats['original']} -> {stats['kept']} (removed {stats['removed']})")
         
         # Sort all kept detections by confidence and limit to top N
         kept_detections = sorted(kept_detections, key=lambda x: x['confidence'], reverse=True)
@@ -734,10 +570,6 @@ class DETRInferenceManager(HailoInferenceManager):
         x1_1, y1_1, x2_1, y2_1 = box1
         x1_2, y1_2, x2_2, y2_2 = box2
         
-        # Debug: Check for suspicious box coordinates
-        if not hasattr(self, '_iou_debug_count'):
-            self._iou_debug_count = 0
-        self._iou_debug_count += 1
         
         # Calculate intersection area
         x1_i = max(x1_1, x1_2)
@@ -755,12 +587,6 @@ class DETRInferenceManager(HailoInferenceManager):
         box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
         union_area = box1_area + box2_area - intersection_area
         
-        # Debug: Log suspicious boxes or high IoU values for first few calculations
-        if self._iou_debug_count <= 10:
-            if box1_area > 50000 or box2_area > 50000:  # Large boxes (might indicate coordinate issues)
-                print(f"[DEBUG] Large box detected: box1_area={box1_area:.1f}, box2_area={box2_area:.1f}")
-                print(f"  box1: [{x1_1:.1f},{y1_1:.1f},{x2_1:.1f},{y2_1:.1f}]")
-                print(f"  box2: [{x1_2:.1f},{y1_2:.1f},{x2_2:.1f},{y2_2:.1f}]")
         
         # Compute IoU
         if union_area == 0:
@@ -768,9 +594,6 @@ class DETRInferenceManager(HailoInferenceManager):
         
         iou = intersection_area / union_area
         
-        # Debug: Log IoU calculations for first few frames
-        if self._iou_debug_count <= 5 and iou > 0.1:
-            print(f"[DEBUG] IoU={iou:.3f} (intersection={intersection_area:.1f}, union={union_area:.1f})")
         
         return iou
     
@@ -794,11 +617,6 @@ class FrameProcessor:
         self.detr_manager = detr_manager
         self.device = device
         self.mtcnn = MTCNN(keep_all=True, device='cpu')
-        print("Initialized MTCNN face detector")
-        if self.scrfd_manager:
-            print("Initialized SCRFD face detector")
-        if self.detr_manager:
-            print("Initialized DETR object detector")
     
     def process_frame(self, frame, width, height):
         """Process a single frame and return gaze results."""
@@ -932,12 +750,7 @@ class ResultSaver:
             
             # Draw object detections if available
             if object_detections:
-                # Debug: Print what we're about to draw
                 non_face_detections = [d for d in object_detections if d.get('class') != 'face']
-                if non_face_detections:
-                    print(f"[DEBUG] Drawing {len(non_face_detections)} object detections")
-                    for i, d in enumerate(non_face_detections[:3]):
-                        print(f"  - {d['class']} at [{d['bbox'][0]}, {d['bbox'][1]}, {d['bbox'][2]}, {d['bbox'][3]}]")
                 
                 for detection in object_detections:
                     if detection.get('class') != 'face':  # Skip faces as they're already drawn
@@ -1025,7 +838,7 @@ class ResultSaver:
             self.saved_frames += 1
             
         except Exception as e:
-            print(f"[DEBUG] Error saving frame: {e}")
+            print(f"Error saving frame: {e}")
     
     def save_inference_data(self, features, boxes, heatmaps, frame_count, object_detections=None, gaze_targets=None):
         """Save raw inference results."""
@@ -1054,7 +867,7 @@ class ResultSaver:
             self.saved_inference += 1
             
         except Exception as e:
-            print(f"[DEBUG] Error saving inference results: {e}")
+            print(f"Error saving inference results: {e}")
 
 
 # ============================================================================
@@ -1152,20 +965,10 @@ class GazeLLECallbackClass(app_callback_class):
         
         # Print configuration
         self._print_config(output_dir, save_mode, save_interval, inference_output_dir)
-        if scrfd_hef_path:
-            print(f"SCRFD face detection model loaded from: {scrfd_hef_path}")
-        if detr_hef_path:
-            print(f"DETR object detection model loaded from: {detr_hef_path}")
     
     def _print_config(self, output_dir, save_mode, save_interval, inference_output_dir):
         """Print configuration summary."""
-        print(f"Output frames will be saved to: {output_dir}")
-        if save_mode == 'time':
-            print(f"Saving frames every {save_interval} seconds")
-        else:
-            print(f"Saving frames every {save_interval} frames")
-        if self.save_inference_results:
-            print(f"Inference results will be saved to: {inference_output_dir}")
+        pass
     
     def should_continue(self):
         """Check if processing should continue."""
@@ -1200,12 +1003,6 @@ def gazelle_callback(pad, info, user_data):
     # Measure processing time
     start_time = time.time()
     
-    # Debug logging
-    if user_data.frame_count % DEBUG_INTERVALS['frame_info'] == 1:
-        if user_data.processing_times:
-            avg_time = sum(user_data.processing_times[-DEBUG_INTERVALS['processing_avg']:]) / \
-                      len(user_data.processing_times[-DEBUG_INTERVALS['processing_avg']:])
-            print(f"[DEBUG] Frame {user_data.frame_count}, Avg processing: {avg_time*1000:.1f}ms")
     
     # Get frame info
     format, width, height = get_caps_from_pad(pad)
@@ -1217,13 +1014,19 @@ def gazelle_callback(pad, info, user_data):
     if frame is None:
         return Gst.PadProbeReturn.OK
     
-    # Debug first frame
-    if user_data.frame_count == 1:
-        print(f"[FORMAT CHECK] Buffer format: {format}, shape: {frame.shape}, dtype: {frame.dtype}")
     
     try:
         # Process frame
         results = user_data.frame_processor.process_frame(frame, width, height)
+        
+        # Log model timing every 10 frames
+        if user_data.frame_count % 10 == 1:
+            if 'timing' in results:
+                timing = results['timing']
+                timing_str = ", ".join([f"{k}: {v:.1f}ms" for k, v in timing.items()])
+                print(f"[TIMING] Frame {user_data.frame_count}: {timing_str}")
+            else:
+                print(f"[TIMING] Frame {user_data.frame_count}: No timing data available")
         
         # Add to GStreamer ROI (for pipeline integration)
         _add_roi_to_buffer(buffer, results['boxes'], results['heatmaps'], width, height)
@@ -1244,7 +1047,7 @@ def gazelle_callback(pad, info, user_data):
             )
             
     except Exception as e:
-        print(f"[DEBUG] Processing error: {e}")
+        print(f"Processing error: {e}")
         import traceback
         traceback.print_exc()
     
@@ -1345,7 +1148,6 @@ class GStreamerGazeLLEApp(GStreamerApp):
             if detected_arch is None:
                 raise ValueError("Could not auto-detect Hailo architecture")
             self.arch = detected_arch
-            print(f"Auto-detected Hailo architecture: {self.arch}")
         else:
             self.arch = self.options_menu.arch
     
@@ -1374,7 +1176,6 @@ class GStreamerGazeLLEApp(GStreamerApp):
             )
         
         pipeline = f'{source} ! {QUEUE("pre_callback_q")} ! {callback} ! {display}'
-        print(f"Pipeline string: {pipeline}")
         return pipeline
     
     def setup_callback(self):
@@ -1384,9 +1185,6 @@ class GStreamerGazeLLEApp(GStreamerApp):
             pad = identity.get_static_pad("src")
             if pad:
                 pad.add_probe(Gst.PadProbeType.BUFFER, self.app_callback, self.user_data)
-                print("Callback probe added successfully")
-        else:
-            print("Warning: Could not find identity element for callback")
     
     def on_pipeline_state_changed(self, bus, msg):
         """Handle pipeline state changes."""
@@ -1407,7 +1205,6 @@ def load_gazelle_model(pth_path, hef_path, device='cpu'):
     # Get HEF dimensions
     hef_model = hpf.HEF(hef_path)
     hef_h, hef_w = get_hef_input_dimensions(hef_model)
-    print(f"HEF input resolution: {hef_w}x{hef_h}")
     
     # Create model
     backbone = DinoV2Backbone("dinov2_vits14")
@@ -1430,7 +1227,6 @@ def load_gazelle_model(pth_path, hef_path, device='cpu'):
     gazelle_model.to(device)
     gazelle_model.eval()
     
-    print("GazeLLE model loaded successfully")
     return gazelle_model
 
 
@@ -1445,7 +1241,6 @@ def main():
     args = parser.parse_args()
     
     # Load model
-    print("Loading GazeLLE model...")
     gazelle_model = load_gazelle_model(args.pth, args.hef, args.device)
     
     # Create callback handler
@@ -1469,14 +1264,7 @@ def main():
     # Create and run application
     app = GStreamerGazeLLEApp(args, user_data)
     
-    # Add heartbeat
-    def heartbeat():
-        print(f"[DEBUG] Heartbeat - Frames processed: {user_data.frame_count}")
-        return True
-    
-    GLib.timeout_add_seconds(DEBUG_INTERVALS['heartbeat'], heartbeat)
-    
-    print("[DEBUG] Starting GStreamer app...")
+    print("Starting GStreamer app...")
     app.run()
 
 
