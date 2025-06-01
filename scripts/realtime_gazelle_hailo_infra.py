@@ -1,162 +1,164 @@
 #!/usr/bin/env python3
 """
-Real-time gaze estimation using Hailo-8 infrastructure with GStreamer.
-Uses hailo_apps_infra for camera capture and processing pipeline.
+Hailo-8 인프라와 GStreamer를 사용한 실시간 시선 추정.
+camera capture와 processing pipeline을 위해 hailo_apps_infra를 사용합니다.
 """
-import argparse
-import sys
-import time
-from pathlib import Path
-import gi
-gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
-import os
-import numpy as np
-import cv2
-import torch
-from PIL import Image
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from facenet_pytorch import MTCNN
-import hailo
-from hailo_platform import (
+import argparse  # 명령줄 인수 파싱을 위한 라이브러리
+import sys  # 시스템 관련 매개변수와 함수에 접근
+import time  # 시간 관련 함수 제공
+from pathlib import Path  # 객체 지향적 파일시스템 경로 처리
+import gi  # GObject Introspection 바인딩
+gi.require_version('Gst', '1.0')  # GStreamer 1.0 버전 요구
+from gi.repository import Gst, GLib  # GStreamer와 GLib 라이브러리 import
+import os  # 운영체제 인터페이스
+import numpy as np  # 수치 계산을 위한 라이브러리
+import cv2  # OpenCV 컴퓨터 비전 라이브러리
+import torch  # PyTorch 딥러닝 프레임워크
+from PIL import Image  # Python Imaging Library
+import matplotlib  # 플롯팅 라이브러리
+matplotlib.use('Agg')  # GUI 없는 백엔드 사용
+import matplotlib.pyplot as plt  # matplotlib의 pyplot 인터페이스
+from facenet_pytorch import MTCNN  # 얼굴 감지를 위한 MTCNN 모델
+import hailo  # Hailo AI 가속기 라이브러리
+from hailo_platform import (  # Hailo 플랫폼 관련 클래스들
     VDevice, HailoStreamInterface, InferVStreams, 
     ConfigureParams, InputVStreamParams, OutputVStreamParams, FormatType
 )
 
-# Add parent directory to import gazelle module
+# gazelle 모듈을 import하기 위해 부모 디렉토리를 경로에 추가
 sys.path.append(str(Path(__file__).parent.parent))
-from gazelle.model import GazeLLE
-from gazelle.backbone import DinoV2Backbone
+from gazelle.model import GazeLLE  # GazeLLE 시선 추정 모델
+from gazelle.backbone import DinoV2Backbone  # DINOv2 backbone 네트워크
 
-# Import hailo infrastructure
+# Hailo 인프라 관련 모듈들 import
 from hailo_apps_infra.hailo_rpi_common import (
-    get_caps_from_pad,
-    get_numpy_from_buffer,
-    app_callback_class,
-    get_default_parser,
-    detect_hailo_arch,
+    get_caps_from_pad,  # GStreamer pad에서 format 정보 추출
+    get_numpy_from_buffer,  # GStreamer buffer를 numpy 배열로 변환
+    app_callback_class,  # 애플리케이션 callback 클래스
+    get_default_parser,  # 기본 argument parser 생성
+    detect_hailo_arch,  # Hailo 아키텍처 자동 감지
 )
-from hailo_apps_infra.gstreamer_app import GStreamerApp
-from hailo_apps_infra.gstreamer_helper_pipelines import (
-    QUEUE,
-    SOURCE_PIPELINE,
-    DISPLAY_PIPELINE,
+from hailo_apps_infra.gstreamer_app import GStreamerApp  # GStreamer 애플리케이션 기본 클래스
+from hailo_apps_infra.gstreamer_helper_pipelines import (  # GStreamer 파이프라인 헬퍼들
+    QUEUE,  # Queue 요소 생성
+    SOURCE_PIPELINE,  # 소스 파이프라인 생성
+    DISPLAY_PIPELINE,  # 디스플레이 파이프라인 생성
 )
 
 
 # ============================================================================
-# Configuration and Constants
+# 설정 및 상수
 # ============================================================================
 
+# 기본 설정값들을 정의한 딕셔너리
 DEFAULT_CONFIG = {
-    'output_dir': './output_frames',
-    'inference_output_dir': './inference_results',
-    'device': 'cpu',
-    'save_interval': 1.0,
-    'max_frames': 10,
-    'skip_frames': 0,
-    'save_mode': 'time',
-    'nominal_fps': 30,
+    'output_dir': './output_frames',  # 출력 프레임 저장 디렉토리
+    'inference_output_dir': './inference_results',  # 추론 결과 저장 디렉토리
+    'device': 'cpu',  # PyTorch 연산 디바이스 (cpu 또는 cuda)
+    'save_interval': 1.0,  # 프레임 저장 간격 (초 단위)
+    'max_frames': 10,  # 최대 저장할 프레임 수
+    'skip_frames': 0,  # 건너뛸 프레임 수
+    'save_mode': 'time',  # 저장 모드 ('time' 또는 'frame')
+    'nominal_fps': 30,  # 명목상 FPS
 }
 
+# 디버그 출력 간격 설정
 DEBUG_INTERVALS = {
-    'frame_info': 10,      # Print frame info every N frames
-    'heartbeat': 5,        # Heartbeat message every N seconds
-    'processing_avg': 10,  # Average processing time over last N frames
+    'frame_info': 10,      # N 프레임마다 프레임 정보 출력
+    'heartbeat': 5,        # N초마다 heartbeat 메시지 출력
+    'processing_avg': 10,  # 마지막 N 프레임의 평균 처리 시간 계산
 }
 
 
 # ============================================================================
-# Utility Functions
+# 유틸리티 함수들
 # ============================================================================
 
 def create_directories(paths):
-    """Create directories if they don't exist."""
-    for path in paths:
-        Path(path).mkdir(exist_ok=True)
+    """디렉토리가 존재하지 않으면 생성합니다."""
+    for path in paths:  # 각 경로에 대해 반복
+        Path(path).mkdir(exist_ok=True)  # 디렉토리 생성 (이미 존재하면 무시)
 
 
 def normalize_bounding_boxes(boxes, width, height):
-    """Normalize bounding boxes to [0,1] range."""
+    """바운딩 박스를 [0,1] 범위로 정규화합니다."""
+    # 각 바운딩 박스를 이미지 크기로 나누어 정규화
     return [[np.array(bbox) / np.array([width, height, width, height]) for bbox in boxes]]
 
 
 def get_hef_input_dimensions(hef_model):
-    """Extract input dimensions from HEF model."""
-    input_vs = hef_model.get_input_vstream_infos()
-    if not input_vs:
-        raise ValueError("Failed to get HEF input info")
+    """HEF 모델에서 입력 차원을 추출합니다."""
+    input_vs = hef_model.get_input_vstream_infos()  # 입력 스트림 정보 가져오기
+    if not input_vs:  # 입력 정보가 없으면 오류 발생
+        raise ValueError("HEF 입력 정보를 가져오는데 실패했습니다")
     
-    shape = input_vs[0].shape
-    if len(shape) == 3:  # HWC format
-        return shape[0], shape[1]
-    else:  # NHWC format
-        return shape[1], shape[2]
+    shape = input_vs[0].shape  # 첫 번째 입력의 shape 가져오기
+    if len(shape) == 3:  # HWC 포맷인 경우
+        return shape[0], shape[1]  # Height, Width 반환
+    else:  # NHWC 포맷인 경우
+        return shape[1], shape[2]  # Height, Width 반환
 
 
 def process_dino_features(feat_raw):
-    """Process raw DINOv2 features into correct tensor format."""
-    if feat_raw.ndim == 3:
-        # [H, W, C] -> [1, C, H, W]
-        feat_processed = np.transpose(feat_raw, (2, 0, 1))
-        feat_processed = np.expand_dims(feat_processed, 0)
-    elif feat_raw.ndim == 4:
-        if feat_raw.shape[-1] == 384:  # [N, H, W, C] format
-            # [N, H, W, C] -> [N, C, H, W]
+    """DINOv2 raw features를 올바른 텐서 포맷으로 처리합니다."""
+    if feat_raw.ndim == 3:  # 3차원 배열인 경우
+        # [H, W, C] -> [1, C, H, W] 포맷으로 변환
+        feat_processed = np.transpose(feat_raw, (2, 0, 1))  # 차원 순서 변경
+        feat_processed = np.expand_dims(feat_processed, 0)  # 배치 차원 추가
+    elif feat_raw.ndim == 4:  # 4차원 배열인 경우
+        if feat_raw.shape[-1] == 384:  # [N, H, W, C] 포맷인 경우
+            # [N, H, W, C] -> [N, C, H, W] 포맷으로 변환
             feat_processed = np.transpose(feat_raw, (0, 3, 1, 2))
-        else:
-            # Already in [N, C, H, W] format
-            feat_processed = feat_raw
-    else:
-        raise ValueError(f"Unexpected feature shape: {feat_raw.shape}")
+        else:  # 이미 [N, C, H, W] 포맷인 경우
+            feat_processed = feat_raw  # 그대로 사용
+    else:  # 예상치 못한 차원인 경우
+        raise ValueError(f"예상치 못한 feature shape: {feat_raw.shape}")
     
-    return feat_processed
+    return feat_processed  # 처리된 feature 반환
 
 
 def find_gaze_point(heatmap):
-    """Find gaze point from heatmap (maximum value location)."""
-    if heatmap.ndim == 3:
-        heatmap = heatmap.squeeze()
-    gaze_y, gaze_x = np.unravel_index(heatmap.argmax(), heatmap.shape)
-    return gaze_x, gaze_y
+    """히트맵에서 시선 지점을 찾습니다 (최대값 위치)."""
+    if heatmap.ndim == 3:  # 3차원인 경우
+        heatmap = heatmap.squeeze()  # 차원 축소
+    gaze_y, gaze_x = np.unravel_index(heatmap.argmax(), heatmap.shape)  # 최대값의 인덱스를 좌표로 변환
+    return gaze_x, gaze_y  # x, y 좌표 반환
 
 
 def compute_gaze_targets(heatmaps, object_detections, img_width, img_height):
-    """Determine which objects are being gazed at based on heatmap and detections."""
-    gaze_targets = []
+    """히트맵과 감지 결과를 기반으로 어떤 객체를 보고 있는지 결정합니다."""
+    gaze_targets = []  # 시선 타겟 리스트 초기화
     
-    for heatmap in heatmaps:
-        if heatmap.ndim == 3:
-            heatmap = heatmap.squeeze()
+    for heatmap in heatmaps:  # 각 히트맵에 대해 반복
+        if heatmap.ndim == 3:  # 3차원인 경우
+            heatmap = heatmap.squeeze()  # 차원 축소
         
-        # Resize heatmap to match image dimensions if needed
+        # 필요시 히트맵을 이미지 크기에 맞게 조정
         if heatmap.shape != (img_height, img_width):
             heatmap = cv2.resize(heatmap, (img_width, img_height))
         
-        # Find the object with highest gaze probability
-        best_object = None
-        best_score = 0.0
+        # 가장 높은 시선 확률을 가진 객체 찾기
+        best_object = None  # 최적 객체 초기화
+        best_score = 0.0  # 최고 점수 초기화
         
-        for detection in object_detections:
-            bbox = detection['bbox']
-            x1, y1, x2, y2 = bbox
+        for detection in object_detections:  # 각 감지된 객체에 대해 반복
+            bbox = detection['bbox']  # 바운딩 박스 가져오기
+            x1, y1, x2, y2 = bbox  # 좌표 분해
             
-            # Extract heatmap region for this bounding box
+            # 이 바운딩 박스에 해당하는 히트맵 영역 추출
             bbox_heatmap = heatmap[y1:y2, x1:x2]
             
-            if bbox_heatmap.size > 0:
-                # Compute average gaze probability in this box
+            if bbox_heatmap.size > 0:  # 히트맵 영역이 존재하는 경우
+                # 이 박스 내의 평균 시선 확률 계산
                 avg_gaze_prob = np.mean(bbox_heatmap)
-                max_gaze_prob = np.max(bbox_heatmap)
+                max_gaze_prob = np.max(bbox_heatmap)  # 최대 시선 확률
                 
-                # Use combination of average and max for robustness
+                # 강건성을 위해 평균과 최대값의 조합 사용
                 combined_score = 0.7 * max_gaze_prob + 0.3 * avg_gaze_prob
                 
-                if combined_score > best_score:
-                    best_score = combined_score
-                    best_object = {
+                if combined_score > best_score:  # 현재까지의 최고 점수보다 높으면
+                    best_score = combined_score  # 최고 점수 업데이트
+                    best_object = {  # 최적 객체 정보 저장
                         'class': detection['class'],
                         'confidence': detection['confidence'],
                         'bbox': bbox,
@@ -165,129 +167,133 @@ def compute_gaze_targets(heatmaps, object_detections, img_width, img_height):
                         'avg_gaze_prob': avg_gaze_prob
                     }
         
-        # Also get the peak gaze point
+        # 피크 시선 지점도 가져오기
         gaze_x, gaze_y = find_gaze_point(heatmap)
         
+        # 시선 타겟 정보 추가
         gaze_targets.append({
-            'gaze_point': (gaze_x, gaze_y),
-            'gaze_object': best_object,
-            'heatmap_max': np.max(heatmap)
+            'gaze_point': (gaze_x, gaze_y),  # 시선 지점 좌표
+            'gaze_object': best_object,  # 시선 대상 객체
+            'heatmap_max': np.max(heatmap)  # 히트맵 최대값
         })
     
-    return gaze_targets
+    return gaze_targets  # 시선 타겟 리스트 반환
 
 
 # ============================================================================
-# Hailo Inference Manager
+# Hailo 추론 관리자
 # ============================================================================
 
 class HailoInferenceManager:
-    """Manages Hailo AI accelerator for DINOv2 inference."""
+    """DINOv2 추론을 위한 Hailo AI 가속기를 관리합니다."""
     
     def __init__(self, hef_path, vdevice=None):
-        self.hef_path = hef_path
-        self.vdevice = vdevice
-        self._init_device()
+        """Hailo 추론 관리자 초기화"""
+        self.hef_path = hef_path  # HEF 모델 파일 경로 저장
+        self.vdevice = vdevice  # 가상 디바이스 객체 저장
+        self._init_device()  # 디바이스 초기화 메서드 호출
     
     def _init_device(self):
-        """Initialize Hailo device and load model."""
-        import hailo_platform as hpf
+        """Hailo 디바이스를 초기화하고 모델을 로드합니다."""
+        import hailo_platform as hpf  # Hailo 플랫폼 라이브러리 import
         
-        # Create Virtual Device if not provided
+        # 가상 디바이스가 제공되지 않았으면 생성
         if self.vdevice is None:
-            self.vdevice = VDevice()
+            self.vdevice = VDevice()  # 새로운 가상 디바이스 생성
         
-        # Load HEF model
-        self.hef = hpf.HEF(self.hef_path)
-        configure_params = ConfigureParams.create_from_hef(
-            self.hef, interface=HailoStreamInterface.PCIe
+        # HEF 모델 로드
+        self.hef = hpf.HEF(self.hef_path)  # HEF 파일에서 모델 로드
+        configure_params = ConfigureParams.create_from_hef(  # HEF에서 설정 파라미터 생성
+            self.hef, interface=HailoStreamInterface.PCIe  # PCIe 인터페이스 사용
         )
-        network_group = self.vdevice.configure(self.hef, configure_params)[0]
+        network_group = self.vdevice.configure(self.hef, configure_params)[0]  # 네트워크 그룹 설정
         
-        # Setup streams
-        self.input_vstreams_params = InputVStreamParams.make(
-            network_group, quantized=True, format_type=FormatType.UINT8
+        # 스트림 설정
+        self.input_vstreams_params = InputVStreamParams.make(  # 입력 스트림 파라미터 생성
+            network_group, quantized=True, format_type=FormatType.UINT8  # 양자화된 UINT8 형식
         )
-        self.output_vstreams_params = OutputVStreamParams.make(
-            network_group, format_type=FormatType.FLOAT32
+        self.output_vstreams_params = OutputVStreamParams.make(  # 출력 스트림 파라미터 생성
+            network_group, format_type=FormatType.FLOAT32  # FLOAT32 형식
         )
         
-        self.network_group = network_group
-        self._print_model_info()
+        self.network_group = network_group  # 네트워크 그룹 저장
+        self._print_model_info()  # 모델 정보 출력
     
     def _print_model_info(self):
-        """Print model input/output specifications."""
-        pass
+        """모델 입력/출력 사양을 출력합니다."""
+        pass  # 현재는 아무것도 하지 않음 (추후 구현 예정)
     
     def run_inference(self, frame):
-        """Run inference on input frame."""
-        # Get input dimensions
-        input_info = self.hef.get_input_vstream_infos()[0]
-        input_shape = input_info.shape
+        """입력 프레임에 대해 추론을 실행합니다."""
+        # 입력 차원 가져오기
+        input_info = self.hef.get_input_vstream_infos()[0]  # 첫 번째 입력 스트림 정보
+        input_shape = input_info.shape  # 입력 형태 가져오기
         
-        if len(input_shape) == 3:  # HWC
-            h, w = input_shape[0], input_shape[1]
-        else:  # NHWC
-            h, w = input_shape[1], input_shape[2]
+        if len(input_shape) == 3:  # HWC 형식인 경우
+            h, w = input_shape[0], input_shape[1]  # 높이, 너비 추출
+        else:  # NHWC 형식인 경우
+            h, w = input_shape[1], input_shape[2]  # 높이, 너비 추출
         
-        # Store original size and model input size for DETR
+        # DETR용으로 원본 크기와 모델 입력 크기 저장
         if isinstance(self, DETRInferenceManager) and self.detr_input_size is None:
-            self.detr_input_size = (h, w)
+            self.detr_input_size = (h, w)  # DETR 입력 크기 저장
         
-        # Resize frame
-        resized = cv2.resize(frame, (w, h))
+        # 프레임 크기 조정
+        resized = cv2.resize(frame, (w, h))  # 모델 입력 크기에 맞게 리사이즈
         
-        # Run inference
-        with InferVStreams(self.network_group, 
-                          self.input_vstreams_params, 
-                          self.output_vstreams_params) as infer_pipeline:
-            input_data = {
-                list(self.input_vstreams_params.keys())[0]: np.expand_dims(resized, axis=0)
+        # 추론 실행
+        with InferVStreams(self.network_group,   # 추론 스트림 생성
+                          self.input_vstreams_params,   # 입력 스트림 파라미터
+                          self.output_vstreams_params) as infer_pipeline:  # 출력 스트림 파라미터
+            input_data = {  # 입력 데이터 준비
+                list(self.input_vstreams_params.keys())[0]: np.expand_dims(resized, axis=0)  # 배치 차원 추가
             }
             
-            with self.network_group.activate(None):
-                results = infer_pipeline.infer(input_data)
+            with self.network_group.activate(None):  # 네트워크 그룹 활성화
+                results = infer_pipeline.infer(input_data)  # 추론 실행
         
-        return results
+        return results  # 추론 결과 반환
 
 
 class SCRFDInferenceManager(HailoInferenceManager):
-    """Specialized manager for SCRFD object detection."""
+    """SCRFD 객체 감지를 위한 전문 관리자입니다."""
     
     def __init__(self, hef_path, vdevice=None):
-        # Call parent class constructor with shared vdevice
+        """SCRFD 추론 관리자 초기화"""
+        # 공유 vdevice로 부모 클래스 생성자 호출
         super().__init__(hef_path, vdevice)
     
     def process_detections(self, outputs, threshold=0.5):
-        """Process SCRFD outputs to get face detections."""
-        # SCRFD typically outputs multiple scales of predictions
-        # This is a simplified version - adjust based on actual model outputs
-        detections = []
+        """SCRFD 출력을 처리하여 얼굴 감지 결과를 얻습니다."""
+        # SCRFD는 일반적으로 다중 스케일 예측을 출력합니다
+        # 이것은 단순화된 버전입니다 - 실제 모델 출력에 맞게 조정하세요
+        detections = []  # 감지 결과 리스트 초기화
         
-        for output_name, output_data in outputs.items():
-            if 'bbox' in output_name or 'loc' in output_name:
-                # Process bounding box predictions
-                # Shape depends on SCRFD variant
+        for output_name, output_data in outputs.items():  # 각 출력에 대해 반복
+            if 'bbox' in output_name or 'loc' in output_name:  # 바운딩 박스 출력인 경우
+                # 바운딩 박스 예측 처리
+                # 형태는 SCRFD 변형에 따라 다름
                 continue
-            elif 'conf' in output_name or 'cls' in output_name:
-                # Process confidence scores
+            elif 'conf' in output_name or 'cls' in output_name:  # 신뢰도 출력인 경우
+                # 신뢰도 점수 처리
                 continue
         
-        # For now, return empty list - implement based on actual SCRFD output format
+        # 현재는 빈 리스트 반환 - 실제 SCRFD 출력 형식에 맞게 구현 필요
         return detections
 
 
 class DETRInferenceManager(HailoInferenceManager):
-    """Specialized manager for DETR object detection."""
+    """DETR 객체 감지를 위한 전문 관리자입니다."""
     
     def __init__(self, hef_path, vdevice=None, confidence_threshold=0.7, nms_threshold=0.3):
-        # Call parent class constructor with shared vdevice
+        """DETR 추론 관리자 초기화"""
+        # 공유 vdevice로 부모 클래스 생성자 호출
         super().__init__(hef_path, vdevice)
-        self.confidence_threshold = confidence_threshold
-        self.nms_threshold = nms_threshold
-        # COCO class names for DETR - 92 classes including placeholders
-        # The model outputs 92 logits: 91 object classes (0-90) + 1 "no-object" class (91)
-        self.COCO_CLASSES_92 = {
+        self.confidence_threshold = confidence_threshold  # 신뢰도 임계값 설정
+        self.nms_threshold = nms_threshold  # NMS 임계값 설정
+        # DETR용 COCO 클래스 이름 - 플레이스홀더를 포함한 92개 클래스
+        # 모델은 92개의 로짓을 출력: 91개 객체 클래스 (0-90) + 1개 "no-object" 클래스 (91)
+        self.COCO_CLASSES_92 = {  # COCO 클래스 라벨 딕셔너리
     0: "unlabeled",
     1: "person",
     2: "bicycle",
