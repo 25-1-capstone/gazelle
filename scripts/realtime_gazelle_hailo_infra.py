@@ -625,54 +625,62 @@ class FrameProcessor:
         self.mtcnn = MTCNN(keep_all=True, device='cpu')
     
     def process_frame(self, frame, width, height):
-        """Process a single frame and return gaze results."""
-        # Run Hailo inference for features
-        infer_results = self.hailo_manager.run_inference(frame)
+        """Process a single frame with unified gazelle and DETR processing."""
+        processing_results = {
+            'features': None,
+            'boxes': [],
+            'heatmaps': [],
+            'object_detections': [],
+            'gaze_targets': [],
+            'highest_probability_target': None,
+            'should_save': False
+        }
         
-        # Extract and process features
+        # Step 1: Run Hailo inference for DINOv2 features
+        if not self.hailo_manager:
+            return processing_results
+            
+        infer_results = self.hailo_manager.run_inference(frame)
         output_name = list(infer_results.keys())[0]
         feat_raw = infer_results[output_name]
         feat_processed = process_dino_features(feat_raw)
         feat_tensor = torch.from_numpy(feat_processed).to(self.device)
+        processing_results['features'] = feat_tensor
         
-        # Detect faces using SCRFD if available, otherwise use MTCNN
+        # Step 2: Face detection for gazelle processing
         face_detections = []
-        object_detections = []
-        
         if self.scrfd_manager:
-            # Run SCRFD for face detection
             scrfd_results = self.scrfd_manager.run_inference(frame)
             scrfd_detections = self.scrfd_manager.process_detections(scrfd_results)
             face_detections.extend(scrfd_detections)
-            
-            # Extract face boxes from SCRFD detections
             face_boxes = [d['bbox'] for d in scrfd_detections if d.get('class') == 'face']
             if face_boxes:
                 boxes = np.array(face_boxes)
             else:
-                # Fallback to MTCNN if no faces detected by SCRFD
                 boxes, probs = self.mtcnn.detect(frame)
         else:
-            # Use MTCNN if SCRFD not available
             boxes, probs = self.mtcnn.detect(frame)
         
         if boxes is None or len(boxes) == 0:
-            # Use center region if no faces detected
             boxes = np.array([[width*0.25, height*0.25, width*0.75, height*0.75]])
         
-        # Run DETR for general object detection if available
+        processing_results['boxes'] = boxes
+        
+        # Step 3: DETR object detection
+        object_detections = []
         if self.detr_manager:
             detr_results = self.detr_manager.run_inference(frame)
             detr_detections = self.detr_manager.process_detections(detr_results, width, height)
             object_detections.extend(detr_detections)
         
-        # Combine all detections
-        all_detections = face_detections + object_detections
+        processing_results['object_detections'] = face_detections + object_detections
         
-        # Normalize bounding boxes
+        # Step 4: Only proceed with gazelle processing if we have both features and objects
+        if len(processing_results['object_detections']) == 0:
+            return processing_results
+        
+        # Step 5: Run GazeLLE inference
         norm_bboxes = normalize_bounding_boxes(boxes, width, height)
-        
-        # Run GazeLLE inference
         with torch.no_grad():
             out = self.gazelle_model({
                 "extracted_features": feat_tensor, 
@@ -680,17 +688,45 @@ class FrameProcessor:
             })
         
         heatmaps = out["heatmap"][0].cpu().numpy()
+        processing_results['heatmaps'] = heatmaps
         
-        # Compute gaze targets
-        gaze_targets = compute_gaze_targets(heatmaps, all_detections, width, height)
+        # Step 6: Compute gaze targets and find highest probability
+        gaze_targets = compute_gaze_targets(heatmaps, processing_results['object_detections'], width, height)
+        processing_results['gaze_targets'] = gaze_targets
         
-        return {
-            'features': feat_tensor,
-            'boxes': boxes,
-            'heatmaps': heatmaps,
-            'object_detections': all_detections,
-            'gaze_targets': gaze_targets
-        }
+        # Step 7: Determine highest probability target across all results
+        highest_prob_target = None
+        highest_prob_score = 0.0
+        
+        # Check gaze targets
+        for target in gaze_targets:
+            if target['gaze_object'] and target['gaze_object']['gaze_score'] > highest_prob_score:
+                highest_prob_score = target['gaze_object']['gaze_score']
+                highest_prob_target = {
+                    'type': 'gaze_target',
+                    'object': target['gaze_object'],
+                    'probability': target['gaze_object']['gaze_score'],
+                    'source': 'gazelle_gaze'
+                }
+        
+        # Check object detection confidence scores
+        for detection in processing_results['object_detections']:
+            if detection['confidence'] > highest_prob_score:
+                highest_prob_score = detection['confidence']
+                highest_prob_target = {
+                    'type': 'object_detection',
+                    'object': detection,
+                    'probability': detection['confidence'],
+                    'source': 'detr_detection'
+                }
+        
+        processing_results['highest_probability_target'] = highest_prob_target
+        
+        # Step 8: Only save if we have a high confidence result
+        if highest_prob_target and highest_prob_score > 0.5:
+            processing_results['should_save'] = True
+        
+        return processing_results
 
 
 # ============================================================================
@@ -712,7 +748,7 @@ class ResultSaver:
             dirs.append(self.inference_output_dir)
         create_directories(dirs)
     
-    def save_visualization(self, frame, boxes, heatmaps, object_detections=None, gaze_targets=None):
+    def save_visualization(self, frame, boxes, heatmaps, object_detections=None, gaze_targets=None, highest_prob_target=None):
         """Save frame with gaze visualization and object detections."""
         try:
             frame_pil = Image.fromarray(frame)
@@ -819,9 +855,12 @@ class ResultSaver:
                     ax.add_patch(plt.Circle((gaze_x, gaze_y), 10, 
                                           fill=False, edgecolor='red', linewidth=2))
             
-            # Update title with gaze information
-            title = f"Gaze Estimation - Frame {self.saved_frames + 1}"
-            if gaze_targets and gaze_targets[0]['gaze_object']:
+            # Update title with unified processing information
+            title = f"Unified Processing - Frame {self.saved_frames + 1}"
+            if highest_prob_target:
+                target_obj = highest_prob_target['object']
+                title += f" | Highest Prob: {target_obj['class']} ({highest_prob_target['probability']:.2f}) [{highest_prob_target['source']}]"
+            elif gaze_targets and gaze_targets[0]['gaze_object']:
                 gazed_class = gaze_targets[0]['gaze_object']['class']
                 title += f" | Looking at: {gazed_class}"
             
@@ -846,7 +885,7 @@ class ResultSaver:
         except Exception as e:
             print(f"Error saving frame: {e}")
     
-    def save_inference_data(self, features, boxes, heatmaps, frame_count, object_detections=None, gaze_targets=None):
+    def save_inference_data(self, features, boxes, heatmaps, frame_count, object_detections=None, gaze_targets=None, highest_prob_target=None):
         """Save raw inference results."""
         if not self.inference_output_dir:
             return
@@ -865,6 +904,9 @@ class ResultSaver:
             
             if gaze_targets:
                 result_dict['gaze_targets'] = gaze_targets
+            
+            if highest_prob_target:
+                result_dict['highest_probability_target'] = highest_prob_target
             
             output_path = self.inference_output_dir / f"inference_{self.saved_inference + 1:04d}.npz"
             np.savez_compressed(output_path, **result_dict)
@@ -1037,19 +1079,29 @@ def gazelle_callback(pad, info, user_data):
         # Add to GStreamer ROI (for pipeline integration)
         _add_roi_to_buffer(buffer, results['boxes'], results['heatmaps'], width, height)
         
-        # Save visualizations
-        if user_data.timing_manager.should_save_frame(rel_t):
+        # Save only if unified processing indicates we should save
+        if results.get('should_save', False) and user_data.timing_manager.should_save_frame(rel_t):
+            # Include highest probability target info in save
             user_data.result_saver.save_visualization(
                 frame, results['boxes'], results['heatmaps'], 
-                results.get('object_detections'), results.get('gaze_targets')
+                results.get('object_detections'), results.get('gaze_targets'),
+                highest_prob_target=results.get('highest_probability_target')
             )
+            
+            # Print unified processing result
+            if results.get('highest_probability_target'):
+                target = results['highest_probability_target']
+                print(f"[UNIFIED] Frame {user_data.frame_count}: {target['source']} - "
+                      f"{target['object']['class']} (prob: {target['probability']:.3f})")
         
-        # Save inference results
-        if user_data.save_inference_results and user_data.timing_manager.should_save_inference(rel_t):
+        # Save inference results only when we have meaningful data
+        if (user_data.save_inference_results and results.get('should_save', False) and 
+            user_data.timing_manager.should_save_inference(rel_t)):
             user_data.result_saver.save_inference_data(
                 results['features'], results['boxes'], results['heatmaps'], 
                 user_data.frame_count, results.get('object_detections'), 
-                results.get('gaze_targets')
+                results.get('gaze_targets'), 
+                highest_prob_target=results.get('highest_probability_target')
             )
             
     except Exception as e:
