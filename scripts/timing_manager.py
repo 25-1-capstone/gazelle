@@ -14,6 +14,18 @@ class TimingManager:
         self.save_interval = save_interval
         self.skip_frames = skip_frames
         
+        # Reset all timing states for fresh start
+        self.reset_timing()
+        
+        # Real-time tracking
+        self.target_processing_interval = 1.0 / (30 / (skip_frames + 1)) if skip_frames > 0 else 1.0 / 30
+        self.processing_overdue_threshold = self.target_processing_interval * 1.5
+    
+    def reset_timing(self):
+        """Reset all timing states for a fresh start."""
+        import time
+        current_time = time.time()
+        
         # Timing tracking
         self.first_pts = None
         self.nominal_fps = DEFAULT_CONFIG['nominal_fps']
@@ -22,10 +34,8 @@ class TimingManager:
         self.last_inference_save_ts = -1e9
         self.last_inference_saved_orig_idx = -1e9
         
-        # Real-time tracking
-        self.last_processed_time = 0
-        self.target_processing_interval = 1.0 / (30 / (skip_frames + 1)) if skip_frames > 0 else 1.0 / 30
-        self.processing_overdue_threshold = self.target_processing_interval * 1.5
+        # Reset real-time tracking
+        self.last_processed_time = current_time
     
     def should_skip_frame(self, frame_count, current_time=None, adaptive_multiplier=1):
         """Check if frame should be skipped with real-time priority."""

@@ -1,0 +1,1 @@
+python realtime_gazelle_hailo_infra.py --hef ~/Downloads/dinov2_vits14_224.hef --pth ~/Downloads/epoch_14.pt --scrfd-hef ~/Downloads/scrfd_10g.hef --detr-hef ~/Downloads/detr_resnet_v1_18_bn.hef -i rpi --output-dir ./output_frames_new --max-frames 10000 --headless

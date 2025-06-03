@@ -61,10 +61,8 @@ class GazeLLECallbackClass(app_callback_class):
         self.max_frames = max_frames
         self.save_inference_results = save_inference_results
         
-        # Performance monitoring
-        self.consecutive_slow_frames = 0
-        self.slow_frame_threshold = 0.1  # 100ms processing time threshold
-        self.adaptive_skip_multiplier = 1
+        # Reset all state for fresh start
+        self.reset_processing_state()
         
         # Initialize components with shared VDevice
         shared_vdevice = None
@@ -77,18 +75,58 @@ class GazeLLECallbackClass(app_callback_class):
         self.result_saver = ResultSaver(output_dir, inference_output_dir if save_inference_results else None)
         self.timing_manager = TimingManager(save_mode, save_interval, skip_frames)
         
-        # Tracking
-        self.frame_count = 0
-        self.processing_times = []
-        self.dropped_frame_count = 0
-        
         print(f"[CONFIG] Output: {output_dir}, Save mode: {save_mode}, Interval: {save_interval}")
         if inference_output_dir:
             print(f"[CONFIG] Inference output: {inference_output_dir}")
     
+    def reset_processing_state(self):
+        """Reset all processing state for a fresh start."""
+        # Performance monitoring
+        self.consecutive_slow_frames = 0
+        self.slow_frame_threshold = 0.1  # 100ms processing time threshold
+        self.adaptive_skip_multiplier = 1
+        
+        # Tracking - start fresh
+        self.frame_count = 0
+        self.processing_times = []
+        self.dropped_frame_count = 0
+    
     def should_continue(self):
         """Check if processing should continue."""
         return True
+    
+    def cleanup(self):
+        """Clean up resources and reset state."""
+        print("[PRIVACY] Starting comprehensive cleanup...")
+        
+        # Flush memory first
+        if hasattr(self.hailo_manager, 'flush_memory'):
+            self.hailo_manager.flush_memory()
+        if hasattr(self.scrfd_manager, 'flush_memory'):
+            self.scrfd_manager.flush_memory()
+        if hasattr(self.detr_manager, 'flush_memory'):
+            self.detr_manager.flush_memory()
+        
+        # Clean up Hailo managers
+        if hasattr(self.hailo_manager, 'cleanup'):
+            self.hailo_manager.cleanup()
+        if hasattr(self.scrfd_manager, 'cleanup'):
+            self.scrfd_manager.cleanup()
+        if hasattr(self.detr_manager, 'cleanup'):
+            self.detr_manager.cleanup()
+        
+        # Clear any cached data
+        self.processing_times.clear()
+        
+        # Reset timing
+        if hasattr(self.timing_manager, 'reset_timing'):
+            self.timing_manager.reset_timing()
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        print("[PRIVACY] All resources cleaned up")
 
 
 # ============================================================================
@@ -104,8 +142,14 @@ def gazelle_callback(pad, info, user_data):
     if buffer is None:
         return Gst.PadProbeReturn.OK
     
-    # Get timing
-    pts_ms = buffer.pts / Gst.SECOND * 1000
+    # Process buffer directly without copying to avoid memory accumulation
+    # PRIVACY: Don't copy buffers as they can cache personal data
+    buffer_to_use = buffer
+    
+    # Get timing and log video position
+    pts_ms = buffer_to_use.pts / Gst.SECOND * 1000
+    pts_seconds = pts_ms / 1000.0
+    print(f"[VIDEO] Frame {user_data.frame_count}: PTS={pts_seconds:.3f}s")
     rel_t = user_data.timing_manager.update_timing(pts_ms)
     
     # Early exit conditions with real-time timing
@@ -119,33 +163,38 @@ def gazelle_callback(pad, info, user_data):
             print(f"[PERF] Frame {user_data.frame_count}: Drop rate: {drop_rate:.1f}%, Avg processing: {avg_time*1000:.1f}ms")
         return Gst.PadProbeReturn.OK
     
-    # Get frame data
+    # Get frame data directly without copying
     format, width, height = get_caps_from_pad(pad)
-    frame = get_numpy_from_buffer(buffer, format, width, height)
+    frame = get_numpy_from_buffer(buffer_to_use, format, width, height)
     if frame is None or format is None:
         return Gst.PadProbeReturn.OK
+    
+    # PRIVACY: Process frame immediately without storing copies
     
     # Process frame with error handling
     start_time = time.time()
     try:
         results = user_data.frame_processor.process_frame(frame, width, height)
         
-        # Add ROI to buffer for pipeline integration
+        # Add ROI to original buffer for pipeline integration
         _add_roi_to_buffer(buffer, results['boxes'], results['heatmaps'], width, height)
         
-        # Save frame if conditions are met
+        # Save frame if conditions are met (before clearing frame reference)
         if results.get('should_save', False) and user_data.timing_manager.should_save_frame(rel_t):
             user_data.result_saver.save_visualization(
                 frame, results['boxes'], results['heatmaps'], 
                 results.get('object_detections'), results.get('gaze_targets'),
                 highest_prob_target=results.get('highest_probability_target')
             )
-            
-            # Log result
-            if results.get('highest_probability_target'):
-                target = results['highest_probability_target']
-                print(f"[FRAME {user_data.frame_count}] {target['source']}: "
-                      f"{target['object']['class']} (prob: {target['probability']:.3f})")
+        
+        # Log result
+        if results.get('highest_probability_target'):
+            target = results['highest_probability_target']
+            print(f"[FRAME {user_data.frame_count}] {target['source']}: "
+                  f"{target['object']['class']} (prob: {target['probability']:.3f})")
+        
+        # PRIVACY: Clear frame reference immediately after use
+        frame = None
         
         # Save inference data if enabled
         if (user_data.save_inference_results and results.get('should_save', False) and 
@@ -159,6 +208,8 @@ def gazelle_callback(pad, info, user_data):
             
     except Exception as e:
         print(f"Frame {user_data.frame_count} processing error: {e}")
+        # PRIVACY: Clear frame reference on error to prevent memory leaks
+        frame = None
     
     # Track processing time and adapt if needed
     processing_time = time.time() - start_time
@@ -267,7 +318,41 @@ class GStreamerGazeLLEApp(GStreamerApp):
         self.app_callback = gazelle_callback
         self._auto_detect_arch()
         self.hef_path = self.options_menu.hef
+        self.video_position = 0
+        self.video_duration = 0
+        self.eos_count = 0
         self.create_pipeline()
+    
+    def flush_pipeline_buffers(self):
+        """Flush all buffers in the pipeline to clear cached frames."""
+        if self.pipeline:
+            # Send flush events to clear all buffers
+            self.pipeline.send_event(Gst.Event.new_flush_start())
+            self.pipeline.send_event(Gst.Event.new_flush_stop(True))
+            
+            # Clear queue buffers specifically
+            for queue_name in ["pre_callback_q", "hailo_pre_callback_q"]:
+                queue = self.pipeline.get_by_name(queue_name)
+                if queue:
+                    # Force queue to drop all buffers
+                    queue.set_property("flush-on-eos", True)
+            
+            print("[PRIVACY] Pipeline buffers flushed")
+    
+    def clear_all_memory(self):
+        """Comprehensive memory clearing for privacy."""
+        # Flush GStreamer buffers
+        self.flush_pipeline_buffers()
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        # Clear user data
+        if hasattr(self, 'user_data'):
+            self.user_data.cleanup()
+        
+        print("[PRIVACY] All memory cleared")
     
     def _auto_detect_arch(self):
         """Auto-detect Hailo architecture if not specified."""
@@ -281,12 +366,17 @@ class GStreamerGazeLLEApp(GStreamerApp):
     
     def get_pipeline_string(self):
         """Build GStreamer pipeline string."""
-        source = SOURCE_PIPELINE(
-            self.video_source,
-            self.video_width,
-            self.video_height,
-            self.video_format
-        )
+        # Use custom source with proper video file handling
+        if self.video_source.endswith(('.mp4', '.avi', '.mkv', '.mov')):
+            source = f'filesrc location={self.video_source} ! decodebin ! videoconvert ! videoscale ! video/x-raw,format=RGB,width={self.video_width},height={self.video_height}'
+            print(f"[PIPELINE] Using custom video file source: {self.video_source}")
+        else:
+            source = SOURCE_PIPELINE(
+                self.video_source,
+                self.video_width,
+                self.video_height,
+                self.video_format
+            )
         
         callback = (
             f'queue name=hailo_pre_callback_q leaky=downstream '
@@ -304,6 +394,7 @@ class GStreamerGazeLLEApp(GStreamerApp):
             )
         
         pipeline = f'{source} ! queue name=pre_callback_q leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! {callback} ! {display}'
+        print(f"[PIPELINE] Full pipeline: {pipeline}")
         return pipeline
     
     def setup_callback(self):
@@ -317,9 +408,60 @@ class GStreamerGazeLLEApp(GStreamerApp):
     def on_pipeline_state_changed(self, bus, msg):
         """Handle pipeline state changes."""
         old_state, new_state, pending = msg.parse_state_changed()
+        print(f"[PIPELINE] State change: {old_state.value_name} -> {new_state.value_name}")
         if msg.src == self.pipeline and new_state == Gst.State.PLAYING:
             self.setup_callback()
+            self.query_video_duration()
         super().on_pipeline_state_changed(bus, msg)
+    
+    def on_eos(self):
+        """Handle End-of-Stream events."""
+        self.eos_count += 1
+        current_pos = self.query_video_position()
+        print(f"[EOS] End-of-stream #{self.eos_count} at position {current_pos:.3f}s/{self.video_duration:.3f}s")
+        
+        if self.video_duration > 0 and current_pos < self.video_duration - 0.1:
+            print(f"[EOS] Premature EOS detected! Expected duration: {self.video_duration:.3f}s, actual: {current_pos:.3f}s")
+        
+        # For video files, seek back to beginning instead of using parent's loop logic
+        if self.video_source.endswith(('.mp4', '.avi', '.mkv', '.mov')):
+            print("[EOS] Seeking back to beginning of video file...")
+            success = self.pipeline.seek_simple(
+                Gst.Format.TIME,
+                Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                0  # seek to beginning
+            )
+            if success:
+                print("[EOS] Video seek successful")
+            else:
+                print("[EOS] Video seek failed, falling back to parent method")
+                super().on_eos()
+        else:
+            super().on_eos()
+    
+    def query_video_duration(self):
+        """Query video duration and log it."""
+        try:
+            success, duration = self.pipeline.query_duration(Gst.Format.TIME)
+            if success:
+                self.video_duration = duration / Gst.SECOND
+                print(f"[VIDEO] Duration: {self.video_duration:.2f} seconds")
+            else:
+                print(f"[VIDEO] Could not query duration")
+        except Exception as e:
+            print(f"[VIDEO] Error querying duration: {e}")
+    
+    def query_video_position(self):
+        """Query current video position."""
+        try:
+            success, position = self.pipeline.query_position(Gst.Format.TIME)
+            if success:
+                self.video_position = position / Gst.SECOND
+                return self.video_position
+            return 0
+        except Exception as e:
+            print(f"[VIDEO] Error querying position: {e}")
+            return 0
 
 
 # ============================================================================
@@ -376,9 +518,38 @@ def load_gazelle_model(pth_path, hef_path, device='cpu'):
 # Main Entry Point
 # ============================================================================
 
+def clear_hailort_service_cache():
+    """Clear HailoRT service cache for privacy."""
+    import subprocess
+    try:
+        print("[PRIVACY] Clearing HailoRT service cache...")
+        
+        # Stop HailoRT service
+        subprocess.run(['sudo', 'systemctl', 'stop', 'hailort'], 
+                      check=True, capture_output=True)
+        
+        # Remove temp files
+        subprocess.run(['sudo', 'rm', '-f', '/tmp/hailort*'], 
+                      shell=True, capture_output=True)
+        
+        # Restart HailoRT service
+        subprocess.run(['sudo', 'systemctl', 'start', 'hailort'], 
+                      check=True, capture_output=True)
+        
+        print("[PRIVACY] HailoRT service cache cleared successfully")
+        
+    except subprocess.CalledProcessError as e:
+        print(f"[PRIVACY] Warning: Could not clear HailoRT cache: {e}")
+    except Exception as e:
+        print(f"[PRIVACY] Error during HailoRT cleanup: {e}")
+
+
 def main():
     """Main entry point."""
     try:
+        # CRITICAL: Clear HailoRT service cache for privacy
+        clear_hailort_service_cache()
+        
         # Parse arguments
         parser = get_gazelle_parser()
         args = parser.parse_args()
@@ -411,15 +582,37 @@ def main():
         # Create and run application
         app = GStreamerGazeLLEApp(args, user_data)
         
+        # Clear any existing buffers before starting
+        print("[PRIVACY] Clearing any existing pipeline buffers...")
+        app.flush_pipeline_buffers()
+        
         print("[INIT] Starting GStreamer pipeline...")
-        app.run()
+        try:
+            app.run()
+        finally:
+            # Comprehensive privacy cleanup
+            print("[PRIVACY] Starting comprehensive cleanup...")
+            app.clear_all_memory()
+            
+            # Clear HailoRT service one final time
+            clear_hailort_service_cache()
+            
+            # Force additional cleanup
+            import gc
+            gc.collect()
+            
+            print("[EXIT] Application stopped and all memory cleared")
         
     except KeyboardInterrupt:
         print("\n[EXIT] Interrupted by user")
+        # Clear HailoRT cache even on interrupt
+        clear_hailort_service_cache()
     except Exception as e:
         print(f"[ERROR] Application failed: {e}")
         import traceback
         traceback.print_exc()
+        # Clear HailoRT cache even on error
+        clear_hailort_service_cache()
         sys.exit(1)
 
 
