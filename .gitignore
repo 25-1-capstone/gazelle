@@ -174,3 +174,5 @@ data/gazefollow/
 output_frames/*
 inference_results/
 output_frames/
+output_frames_new/
+output_frames*

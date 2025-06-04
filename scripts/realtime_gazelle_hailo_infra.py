@@ -12,6 +12,7 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
 import torch
 import hailo
+import paho.mqtt.client as mqtt
 
 # Add parent directory to path for gazelle modules
 sys.path.append(str(Path(__file__).parent.parent))
@@ -53,13 +54,18 @@ class GazeLLECallbackClass(app_callback_class):
                  save_interval=1.0, max_frames=10, hef_path=None, skip_frames=0,
                  save_inference_results=False, inference_output_dir='./inference_results',
                  save_mode='time', scrfd_hef_path=None, detr_hef_path=None,
-                 detr_confidence=0.7, detr_nms=0.3):
+                 detr_confidence=0.7, detr_nms=0.3, mqtt_host='18.208.62.86'):
         super().__init__()
         
         # Configuration
         self.device = device
         self.max_frames = max_frames
         self.save_inference_results = save_inference_results
+        
+        # MQTT configuration
+        self.mqtt_host = mqtt_host
+        self.mqtt_client = None
+        self.setup_mqtt()
         
         # Reset all state for fresh start
         self.reset_processing_state()
@@ -78,6 +84,43 @@ class GazeLLECallbackClass(app_callback_class):
         print(f"[CONFIG] Output: {output_dir}, Save mode: {save_mode}, Interval: {save_interval}")
         if inference_output_dir:
             print(f"[CONFIG] Inference output: {inference_output_dir}")
+    
+    def setup_mqtt(self):
+        """Initialize MQTT client and connect to broker."""
+        try:
+            self.mqtt_client = mqtt.Client()
+            self.mqtt_client.on_connect = self.on_mqtt_connect
+            self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+            self.mqtt_client.connect(self.mqtt_host, 1883, 60)
+            self.mqtt_client.loop_start()
+            print(f"[MQTT] Connecting to broker at {self.mqtt_host}")
+        except Exception as e:
+            print(f"[MQTT] Failed to setup MQTT client: {e}")
+            self.mqtt_client = None
+    
+    def on_mqtt_connect(self, client, userdata, flags, rc):
+        """Callback for when MQTT client connects."""
+        if rc == 0:
+            print("[MQTT] Connected successfully")
+            # Send initialization message
+            self.send_mqtt_message("init/caps1", "initialize connection")
+        else:
+            print(f"[MQTT] Connection failed with code {rc}")
+    
+    def on_mqtt_disconnect(self, client, userdata, rc):
+        """Callback for when MQTT client disconnects."""
+        print(f"[MQTT] Disconnected with code {rc}")
+    
+    def send_mqtt_message(self, topic, message):
+        """Send MQTT message to specified topic."""
+        if self.mqtt_client and self.mqtt_client.is_connected():
+            try:
+                self.mqtt_client.publish(topic, message)
+                print(f"[MQTT] Sent to {topic}: {message}")
+            except Exception as e:
+                print(f"[MQTT] Failed to send message: {e}")
+        else:
+            print(f"[MQTT] Client not connected, message not sent: {topic} - {message}")
     
     def reset_processing_state(self):
         """Reset all processing state for a fresh start."""
@@ -114,6 +157,12 @@ class GazeLLECallbackClass(app_callback_class):
             self.scrfd_manager.cleanup()
         if hasattr(self.detr_manager, 'cleanup'):
             self.detr_manager.cleanup()
+        
+        # Clean up MQTT client
+        if self.mqtt_client:
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
+            print("[MQTT] Client disconnected")
         
         # Clear any cached data
         self.processing_times.clear()
@@ -187,11 +236,17 @@ def gazelle_callback(pad, info, user_data):
                 highest_prob_target=results.get('highest_probability_target')
             )
         
-        # Log result
+        # Log result and send MQTT message
         if results.get('highest_probability_target'):
             target = results['highest_probability_target']
-            print(f"[FRAME {user_data.frame_count}] {target['source']}: "
-                  f"{target['object']['class']} (prob: {target['probability']:.3f})")
+            log_message = f"[FRAME {user_data.frame_count}] {target['source']}: " \
+                         f"{target['object']['class']} (prob: {target['probability']:.3f})"
+            print(log_message)
+            
+            # Send MQTT message when user is looking at something
+            if "user is looking at something" in log_message.lower() or target['probability'] > 0.5:
+                mqtt_message = f"user looking at {target['object']['class']} with probability {target['probability']:.3f}"
+                user_data.send_mqtt_message("state/caps1", mqtt_message)
         
         # PRIVACY: Clear frame reference immediately after use
         frame = None
@@ -576,7 +631,8 @@ def main():
             scrfd_hef_path=args.scrfd_hef,
             detr_hef_path=args.detr_hef,
             detr_confidence=args.detr_confidence,
-            detr_nms=args.detr_nms
+            detr_nms=args.detr_nms,
+            mqtt_host='18.208.62.86'
         )
         
         # Create and run application
