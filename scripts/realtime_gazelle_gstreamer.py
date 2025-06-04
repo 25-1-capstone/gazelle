@@ -253,25 +253,24 @@ def main():
                         print(f"MTCNN inference time: {mtcnn_time*1000:.2f}ms")
                         
                         if boxes_original is None or len(boxes_original) == 0:
-                            # No faces detected, use default center box
+                            # No faces detected - skip all processing except logging
                             # Save a debug frame to check what the video contains
                             if frame_count == 0:
                                 debug_path = output_dir / "debug_original_frame.png"
                                 cv2.imwrite(str(debug_path), frame)
                                 print(f"Saved debug frame to {debug_path} for inspection")
-                            print(f"No faces detected in frame, using default center region")
-                            # Scale default box to resized frame dimensions
-                            boxes = np.array([[hef_w*0.25, hef_h*0.25, hef_w*0.75, hef_h*0.75]])
-                        else:
-                            # Scale detected boxes to resized frame dimensions
-                            scale_x = hef_w / frame.shape[1]
-                            scale_y = hef_h / frame.shape[0]
-                            boxes = []
-                            for box in boxes_original:
-                                x1, y1, x2, y2 = box
-                                boxes.append([x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y])
-                            boxes = np.array(boxes)
-                            print(f"Detected {len(boxes)} face(s) in frame")
+                            print(f"No faces detected in frame - skipping processing")
+                            continue
+                        
+                        # Scale detected boxes to resized frame dimensions
+                        scale_x = hef_w / frame.shape[1]
+                        scale_y = hef_h / frame.shape[0]
+                        boxes = []
+                        for box in boxes_original:
+                            x1, y1, x2, y2 = box
+                            boxes.append([x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y])
+                        boxes = np.array(boxes)
+                        print(f"Detected {len(boxes)} face(s) in frame")
 
                         if frame.shape[1] != hef_w or frame.shape[0] != hef_h:
                             frame_in = cv2.resize(frame, (hef_w, hef_h))

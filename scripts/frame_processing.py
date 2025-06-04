@@ -33,18 +33,7 @@ class FrameProcessor:
             'should_save': False
         }
         
-        # Step 1: Run Hailo inference for DINOv2 features
-        if not self.hailo_manager:
-            return processing_results
-            
-        infer_results = self.hailo_manager.run_inference(frame)
-        output_name = list(infer_results.keys())[0]
-        feat_raw = infer_results[output_name]
-        feat_processed = process_dino_features(feat_raw)
-        feat_tensor = torch.from_numpy(feat_processed).to(self.device)
-        processing_results['features'] = feat_tensor
-        
-        # Step 2: Face detection for gazelle processing
+        # Step 1: Face detection first to avoid unnecessary processing
         face_detections = []
         if self.scrfd_manager:
             scrfd_results = self.scrfd_manager.run_inference(frame)
@@ -58,8 +47,21 @@ class FrameProcessor:
         else:
             boxes, probs = self.mtcnn.detect(frame)
         
+        # Early exit if no faces detected - skip all processing including Hailo inference
         if boxes is None or len(boxes) == 0:
-            boxes = np.array([[width*0.25, height*0.25, width*0.75, height*0.75]])
+            processing_results['no_faces_detected'] = True
+            return processing_results
+        
+        # Step 2: Run Hailo inference for DINOv2 features (only if faces detected)
+        if not self.hailo_manager:
+            return processing_results
+            
+        infer_results = self.hailo_manager.run_inference(frame)
+        output_name = list(infer_results.keys())[0]
+        feat_raw = infer_results[output_name]
+        feat_processed = process_dino_features(feat_raw)
+        feat_tensor = torch.from_numpy(feat_processed).to(self.device)
+        processing_results['features'] = feat_tensor
         
         processing_results['boxes'] = boxes
         

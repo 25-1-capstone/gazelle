@@ -225,6 +225,13 @@ def gazelle_callback(pad, info, user_data):
     try:
         results = user_data.frame_processor.process_frame(frame, width, height)
         
+        # Check if no faces were detected - skip all processing except logging
+        if results.get('no_faces_detected', False):
+            print(f"[FRAME {user_data.frame_count}] No faces detected - skipping processing")
+            # PRIVACY: Clear frame reference immediately
+            frame = None
+            return Gst.PadProbeReturn.OK
+        
         # Add ROI to original buffer for pipeline integration
         _add_roi_to_buffer(buffer, results['boxes'], results['heatmaps'], width, height)
         
